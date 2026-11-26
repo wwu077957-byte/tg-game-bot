@@ -4,7 +4,7 @@
 
 ## 功能与限制
 
-- 登录仅支持二维码：`/qr` 开始，明确同意后扫描二维码；扫码后仍可按 Telegram 的要求输入账号 2FA 密码。手机号、短信验证码、国家/地区选择、验证码重发及旧的验证码读取入口均已移除。
+- 登录仅支持二维码：`/qr` 开始，明确同意后扫描二维码；二维码过期时可点图片下方的“刷新二维码”按钮，在当前登录流程中换取新码，无需重新确认。扫码后仍可按 Telegram 的要求输入账号 2FA 密码。手机号、短信验证码、国家/地区选择、验证码重发及旧的验证码读取入口均已移除。
 - 账号列表、个人备注、分组、搜索、操作记录、回收站、登录设备和 2FA 状态查看。
 - 会话、账号及功能分离仍按 Telegram 用户 ID 隔离；本次移除登录路径不会清理已存账号、手机号字段或会话。
 - 可选安全提醒：只提醒收到 Telegram 官方服务账号的消息，不转发正文或验证码。
@@ -81,6 +81,6 @@ Bot 与 Telegram 之间的私聊仍受 Telegram 平台和客户端保护方式�
 
 ## 命令
 
-`/accounts`、`/qr`、`/consent`、`/groups`、`/group_create 分组名`、`/move 账号ID 分组名`、`/rename 账号ID 新备注`、`/devices`、`/2fa`、`/search 关键词`、`/notify_on`、`/notify_off`、`/autoreply`、`/auto_all`、`/auto_all_off`、`/audit`、`/trash`、`/delete 账号ID`、`/restore 账号ID`、`/language`、`/cancel`、`/help`。`/qr` 是唯一添加账号的入口；旧 `/add`、`/resend`、`/code` 命令及其手机号/验证码流程已移除。首次使用先做一次人机验证，再要求加入 [@dro8r](https://t.me/dro8r)；后续每次操作会自动核验频道成员。`/language` 或主菜单中的“语言 / Language”可切换中文/英文。`/autoreply` 使用可点选的账号列表，按一次即可单独开启/关闭；可设置一条通用回复，或查看最近记录。`/auto_all` 和 `/auto_all_off` 仍保留为兼容旧用法的命令。`/devices` 与 `/2fa` 可打开只含本人账号的选择器；也可在命令后输入本人账号 ID。
+`/accounts`、`/qr`、`/consent`、`/groups`、`/group_create 分组名`、`/move 账号ID 分组名`、`/rename 账号ID 新备注`、`/devices`、`/2fa`、`/search 关键词`、`/notify_on`、`/notify_off`、`/autoreply`、`/auto_all`、`/auto_all_off`、`/audit`、`/trash`、`/delete 账号ID`、`/restore 账号ID`、`/language`、`/cancel`、`/help`。`/qr` 是唯一添加账号的入口；二维码过期时可点图片下方按钮刷新。旧 `/add`、`/resend`、`/code` 命令及其手机号/验证码流程已移除。首次使用先做一次人机验证，再要求加入 [@dro8r](https://t.me/dro8r)；后续每次操作会自动核验频道成员。`/language` 或主菜单中的“语言 / Language”可切换中文/英文。`/autoreply` 使用可点选的账号列表，按一次即可单独开启/关闭；可设置一条通用回复，或查看最近记录。`/auto_all` 和 `/auto_all_off` 仍保留为兼容旧用法的命令。`/devices` 与 `/2fa` 可打开只含本人账号的选择器；也可在命令后输入本人账号 ID。
 
 当前代码仅为 MVP。本次部署会替换 Bot 功能，但不会自动完成主机隔离、备份方案、数据恢复演练或真实 Telegram 账号验证。

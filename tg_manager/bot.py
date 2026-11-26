@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from dotenv import load_dotenv
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
+from telegram import InputMediaPhoto, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -64,6 +64,7 @@ class Flow:
     qr_login: Any = None
     task: asyncio.Task | None = None
     started_at: float = field(default_factory=time.monotonic)
+    qr_refresh_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
 
 @dataclass
@@ -96,6 +97,29 @@ OFFICIAL_CHANNEL_URL = "https://t.me/dro8r"
 def ui_text(language: str, chinese: str, english: str) -> str:
     """Choose UI copy without changing stored language or user-authored content."""
     return english if language == "en" else chinese
+
+
+def qr_refresh_keyboard(language: str) -> InlineKeyboardMarkup:
+    label = ui_text(language, "🔄 刷新二维码", "🔄 Refresh QR code")
+    return InlineKeyboardMarkup([[InlineKeyboardButton(label, callback_data="qr:refresh")]])
+
+
+def qr_login_caption(language: str) -> str:
+    return ui_text(
+        language,
+        "用你本人已登录的 Telegram 官方客户端扫描此二维码。二维码等同登录授权，请勿转发或截图分享。如账号启用 2FA，扫描后会在此私聊要求输入密码。\n二维码过期？点击下方“刷新二维码”。",
+        "Scan this QR code with the official Telegram client where you are logged in. The QR code is equivalent to login authorization; do not forward or share screenshots. If the account has 2FA enabled, you will be asked for the password in this private chat after scanning.\nExpired? Tap “Refresh QR code” below.",
+    )
+
+
+def qr_code_buffer(url: str) -> io.BytesIO:
+    import qrcode
+
+    image = qrcode.make(url)
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    buffer.seek(0)
+    return buffer
 
 
 def menu_for(language: str) -> ReplyKeyboardMarkup:
@@ -429,15 +453,11 @@ async def qr_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         flow = Flow(state="qr_wait", client=client, qr_login=qr)
         flows[user_id] = flow
         flow.task = asyncio.create_task(wait_for_qr(user_id, flow, context.application))
-        import qrcode
-
-        image = qrcode.make(qr.url)
-        buffer = io.BytesIO()
-        image.save(buffer, format="PNG")
-        buffer.seek(0)
+        language = store.get_language(user_id)
         await update.effective_message.reply_photo(
-            photo=buffer,
-            caption=ui_text(update.effective_user and store.get_language(update.effective_user.id) or "zh", '用你本人已登录的 Telegram 官方客户端扫描此二维码。二维码等同登录授权，请勿转发或截图分享。如账号启用 2FA，扫描后会在此私聊要求输入密码。', 'Scan this QR code with the official Telegram client where you are logged in. The QR code is equivalent to login authorization; do not forward it or share screenshots. If the account has 2FA enabled, you will be asked to enter the password in this private chat after scanning.'),
+            photo=qr_code_buffer(qr.url),
+            caption=qr_login_caption(language),
+            reply_markup=qr_refresh_keyboard(language),
         )
         store.audit(user_id, "qr_login_started", None, "QR flow started")
     except FloodWaitError as exc:
@@ -447,6 +467,119 @@ async def qr_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     except Exception:
         await cleanup_flow(user_id)
         await update.effective_message.reply_text(ui_text(update.effective_user and store.get_language(update.effective_user.id) or "zh", '无法启动二维码登录，请稍后重试。', 'Unable to start QR login. Please try again later.'))
+
+
+async def qr_refresh_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    user = update.effective_user
+    if not query or not user:
+        return
+    if not await require_callback_access(update, query, context.bot):
+        return
+
+    user_id = user.id
+    language = store.get_language(user_id)
+    flow = flows.get(user_id)
+    if not flow or flow.state != "qr_wait" or not flow.client or not flow.qr_login:
+        await query.answer(
+            ui_text(language, '没有可刷新的二维码。请发送 /qr 重新开始。', 'There is no active QR code to refresh. Send /qr to start again.'),
+            show_alert=True,
+        )
+        return
+    if flow_is_expired(flow):
+        await cleanup_flow(user_id)
+        await query.answer(
+            ui_text(language, '二维码登录流程已超时，请发送 /qr 并再次确认。', 'The QR login flow expired. Send /qr and confirm again.'),
+            show_alert=True,
+        )
+        return
+
+    async with flow.qr_refresh_lock:
+        if flows.get(user_id) is not flow or flow.state != "qr_wait":
+            await query.answer(
+                ui_text(language, '当前二维码登录已结束。', 'This QR login has already ended.'),
+                show_alert=True,
+            )
+            return
+        old_task = flow.task
+        if old_task and old_task is not asyncio.current_task() and not old_task.done():
+            old_task.cancel()
+            try:
+                await old_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+
+        try:
+            await flow.qr_login.recreate()
+        except FloodWaitError as exc:
+            store.defer_auth_attempt(user_id, "code", exc.seconds, account_phone="qr")
+            if flows.get(user_id) is flow and flow.state == "qr_wait":
+                flow.task = asyncio.create_task(wait_for_qr(user_id, flow, context.application))
+            await query.answer(
+                ui_text(language, 'Telegram 要求等待 {0} 秒后才能刷新二维码；请稍后再点。', 'Telegram requires a {0}-second wait before refreshing the QR code. Please try again later.').format(exc.seconds),
+                show_alert=True,
+            )
+            return
+        except Exception:
+            if flows.get(user_id) is flow and flow.state == "qr_wait":
+                flow.task = asyncio.create_task(wait_for_qr(user_id, flow, context.application))
+            await query.answer(
+                ui_text(language, '刷新失败，当前登录流程仍保留；请稍后再试。', 'Could not refresh the QR code. The current login flow is still active; please try again later.'),
+                show_alert=True,
+            )
+            return
+
+        if flows.get(user_id) is not flow or flow.state != "qr_wait":
+            await query.answer(
+                ui_text(language, '当前二维码登录已结束。', 'This QR login has already ended.'),
+                show_alert=True,
+            )
+            return
+
+        flow.task = asyncio.create_task(wait_for_qr(user_id, flow, context.application))
+        try:
+            await query.edit_message_media(
+                media=InputMediaPhoto(media=qr_code_buffer(flow.qr_login.url), caption=qr_login_caption(language)),
+                reply_markup=qr_refresh_keyboard(language),
+            )
+        except Exception:
+            sent_new_qr = False
+            if query.message:
+                try:
+                    await query.message.reply_photo(
+                        photo=qr_code_buffer(flow.qr_login.url),
+                        caption=qr_login_caption(language),
+                        reply_markup=qr_refresh_keyboard(language),
+                    )
+                    sent_new_qr = True
+                    try:
+                        await query.edit_message_reply_markup(reply_markup=None)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+            if not sent_new_qr:
+                await cleanup_flow(user_id)
+                try:
+                    await query.answer(
+                        ui_text(language, '无法显示新二维码，登录流程已取消；请稍后重新发送 /qr。', 'The new QR code could not be displayed, so the login flow was canceled. Send /qr again later.'),
+                        show_alert=True,
+                    )
+                except Exception:
+                    pass
+                return
+            try:
+                await query.answer(ui_text(language, '已刷新，新二维码已另发。', 'Refreshed. The new QR code was sent in a separate message.'))
+            except Exception:
+                pass
+            return
+
+        try:
+            await query.answer(ui_text(language, '二维码已刷新。', 'QR code refreshed.'))
+        except Exception:
+            pass
 
 
 async def consent_login(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -466,7 +599,8 @@ async def consent_login(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def wait_for_qr(user_id: int, flow: Flow, application: Application) -> None:
     try:
-        await flow.qr_login.wait(timeout=180)
+        remaining = max(1.0, FLOW_TTL_SECONDS - (time.monotonic() - flow.started_at))
+        await flow.qr_login.wait(timeout=remaining)
         if flows.get(user_id) is not flow:
             return
         await finish_login(user_id, flow, application, phone_hint="二维码登录")
@@ -1473,6 +1607,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if store.get_language(owner_id(update)) == "en":
         text = (
             "Commands\n/accounts — my accounts\n/qr — add your own Telegram account by QR login\n"
+            "If it expires, tap Refresh QR code below the image; no need to restart consent.\n"
             "/groups, /group_create, /move — manage account groups\n/rename — rename an account\n"
             "/devices — login devices\n/2fa — 2FA status\n/search — find an account\n/trash, /delete, /restore — manage deleted accounts\n"
             "/autoreply — simple per-account auto-reply settings\n/language — switch Chinese/English\n"
@@ -1483,6 +1618,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     else:
         text = (
             "命令说明\n/accounts — 我的账号\n/qr — 扫描二维码添加本人账号\n"
+            "二维码过期时，点击图片下方“刷新二维码”即可继续，无需重新确认。\n"
             "/groups、/group_create、/move — 管理账号分组\n/rename — 修改账号备注\n"
             "/devices — 登录设备\n/2fa — 2FA 状态\n/search — 搜索账号\n/trash、/delete、/restore — 管理已删除账号\n"
             "/autoreply — 简单的逐账号自动回复设置\n/language — 切换中文/English\n"
@@ -1563,6 +1699,7 @@ def register_handlers(app: Application) -> None:
     app.add_handler(CallbackQueryHandler(human_captcha_callback, pattern=r"^human:"))
     app.add_handler(CallbackQueryHandler(channel_check_callback, pattern=r"^channel:"))
     app.add_handler(CallbackQueryHandler(language_callback, pattern=r"^lang:"))
+    app.add_handler(CallbackQueryHandler(qr_refresh_callback, pattern=r"^qr:refresh$"))
     app.add_handler(CallbackQueryHandler(account_picker_callback, pattern=r"^acctpick:"))
     app.add_handler(CallbackQueryHandler(auto_reply_callback, pattern=r"^auto:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))

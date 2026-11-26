@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import io
 import os
 import tempfile
 import time
@@ -102,6 +104,47 @@ class LoginFlowGuardTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("consent", commands)
         self.assertTrue({"add", "code", "resend"}.isdisjoint(commands))
         self.assertFalse(any("ctry:" in pattern for pattern in callback_patterns))
+        self.assertIn("^qr:refresh$", callback_patterns)
+
+    async def test_qr_refresh_button_is_bilingual(self) -> None:
+        chinese = [button.text for row in bot.qr_refresh_keyboard("zh").inline_keyboard for button in row]
+        english = [button.text for row in bot.qr_refresh_keyboard("en").inline_keyboard for button in row]
+
+        self.assertIn("🔄 刷新二维码", chinese)
+        self.assertIn("🔄 Refresh QR code", english)
+        self.assertIn("刷新二维码", bot.qr_login_caption("zh"))
+        self.assertIn("Refresh QR code", bot.qr_login_caption("en"))
+
+    async def test_qr_refresh_recreates_code_in_the_active_flow(self) -> None:
+        old_wait = asyncio.create_task(asyncio.Event().wait())
+        qr_login = SimpleNamespace(url="tg://login?token=renewed", recreate=AsyncMock())
+        flow = bot.Flow(state="qr_wait", client=object(), qr_login=qr_login, task=old_wait)
+        bot.flows[self.user_id] = flow
+        query = SimpleNamespace(
+            answer=AsyncMock(),
+            edit_message_media=AsyncMock(),
+            edit_message_reply_markup=AsyncMock(),
+            message=FakeMessage(),
+        )
+        update = self.update()
+        update.callback_query = query
+        context = SimpleNamespace(bot=SimpleNamespace(send_message=AsyncMock()), application=object())
+
+        with patch.object(bot, "qr_code_buffer", return_value=io.BytesIO(b"qr")), patch.object(
+            bot, "wait_for_qr", new=AsyncMock()
+        ):
+            await bot.qr_refresh_callback(update, context)
+
+        qr_login.recreate.assert_awaited_once()
+        query.edit_message_media.assert_awaited_once()
+        media = query.edit_message_media.await_args.kwargs["media"]
+        self.assertIsInstance(media, bot.InputMediaPhoto)
+        self.assertEqual(flow.state, "qr_wait")
+        self.assertIsNot(flow.task, old_wait)
+        self.assertEqual(query.answer.await_count, 1)
+        if flow.task and not flow.task.done():
+            flow.task.cancel()
+            await asyncio.gather(flow.task, return_exceptions=True)
 
     async def test_qr_password_flow_expiry_clears_old_state(self) -> None:
         message = FakeMessage("a message")
