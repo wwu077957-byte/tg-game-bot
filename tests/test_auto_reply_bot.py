@@ -131,6 +131,13 @@ class AutoReplyBotTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(bot.is_channel_member(SimpleNamespace(status="restricted", is_member=False)))
         self.assertFalse(bot.is_channel_member(SimpleNamespace(status="left")))
 
+    def test_reopened_human_check_repeats_the_same_question(self) -> None:
+        first_question, first_keyboard = bot.human_challenge(101, "zh")
+        next_question, next_keyboard = bot.human_challenge(101, "zh")
+        self.assertEqual(first_question, next_question)
+        self.assertIn(" + ", next_question)
+        self.assertEqual(first_keyboard, next_keyboard)
+
     async def test_first_use_requires_human_check_then_official_channel_membership(self) -> None:
         message = FakeGateMessage()
         update = SimpleNamespace(

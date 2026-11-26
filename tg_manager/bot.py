@@ -104,7 +104,7 @@ def flow_is_expired(flow: Flow) -> bool:
 
 flows: dict[int, Flow] = {}
 auto_flows: dict[int, AutoFlow] = {}
-pending_human_challenges: dict[int, tuple[int, list[int], float]] = {}
+pending_human_challenges: dict[int, tuple[int, list[int], float, int, int]] = {}
 monitors: dict[tuple[int, int], tuple[TelegramClient, asyncio.Task]] = {}
 auto_reply_locks: dict[tuple[int, int], asyncio.Lock] = {}
 auto_sending_peers: set[tuple[int, int]] = set()
@@ -168,11 +168,10 @@ def human_challenge(user_id: int, language: str) -> tuple[str, InlineKeyboardMar
             choices.add(random.randint(2, 18))
         options = list(choices)
         random.shuffle(options)
-        pending_human_challenges[user_id] = (answer, options, time.monotonic() + 600)
+        pending_human_challenges[user_id] = (answer, options, time.monotonic() + 600, left, right)
         current = pending_human_challenges[user_id]
-        question = f"一次性人机验证：{left} + {right} 等于多少？" if language == "zh" else f"One-time human check: what is {left} + {right}?"
-    else:
-        question = "请完成一次人机验证，点选正确答案。" if language == "zh" else "Complete the one-time human check by choosing the answer."
+    left, right = current[3], current[4]
+    question = f"一次性人机验证：{left} + {right} 等于多少？" if language == "zh" else f"One-time human check: what is {left} + {right}?"
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton(str(value), callback_data=f"human:{value}") for value in current[1][:2]],
         [InlineKeyboardButton(str(value), callback_data=f"human:{value}") for value in current[1][2:]],
