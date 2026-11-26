@@ -4,6 +4,7 @@ import asyncio
 import io
 import logging
 import os
+import random
 import re
 import time
 from dataclasses import dataclass, field
@@ -33,6 +34,7 @@ from telethon.errors import (
 from telethon.sessions import StringSession
 
 from .storage import Store
+from .auto_reply import SCENE_LABELS, choose_scene, local_datetime, normalize_config, offline_reason, render_template
 from .security import is_allowed_user_id, parse_allowed_user_ids
 from .picker import build_account_picker, parse_picker_callback
 from .countries import (
@@ -85,6 +87,14 @@ class Flow:
     started_at: float = field(default_factory=time.monotonic)
 
 
+@dataclass
+class AutoFlow:
+    state: str
+    account_id: int
+    scene: str | None = None
+    started_at: float = field(default_factory=time.monotonic)
+
+
 FLOW_TTL_SECONDS = 600
 
 
@@ -93,7 +103,10 @@ def flow_is_expired(flow: Flow) -> bool:
 
 
 flows: dict[int, Flow] = {}
+auto_flows: dict[int, AutoFlow] = {}
 monitors: dict[tuple[int, int], tuple[TelegramClient, asyncio.Task]] = {}
+auto_reply_locks: dict[tuple[int, int], asyncio.Lock] = {}
+auto_sending_peers: set[tuple[int, int]] = set()
 last_qr_login_attempt: dict[int, float] = {}
 LOGIN_COOLDOWN_SECONDS = max(30, int(os.getenv("LOGIN_COOLDOWN_SECONDS", "60")))
 COUNTRY_PAGE_SIZE = 8
@@ -102,10 +115,11 @@ MENU = ReplyKeyboardMarkup(
     [
         ["📱 账号列表", "➕ 添加账号"],
         ["🔳 QR 登录", "📩 获取验证码"],
-        ["📁 账号分组", "💻 设备会话"],
-        ["🛡 2FA 状态", "🔎 搜索账号"],
-        ["🔔 通知与健康", "🧾 操作记录"],
-        ["🗑 回收站", "❔ 帮助"],
+            ["📁 账号分组", "💻 设备会话"],
+            ["🛡 2FA 状态", "🔎 搜索账号"],
+            ["🤖 自动回复", "🔔 通知与健康"],
+            ["🧾 操作记录", "🗑 回收站"],
+            ["❔ 帮助"],
     ],
     resize_keyboard=True,
     input_field_placeholder="选择功能或发送命令",
@@ -564,6 +578,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "💻 设备会话": devices,
         "🛡 2FA 状态": twofa,
         "🔎 搜索账号": search_prompt,
+        "🤖 自动回复": auto_reply_entry,
         "🔔 通知与健康": settings,
         "🧾 操作记录": audit,
         "🗑 回收站": trash,
@@ -573,6 +588,69 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await menu_handlers[text](update, context)
         return
     user_id = owner_id(update)
+    auto_flow = auto_flows.get(user_id)
+    if auto_flow:
+        if time.monotonic() - auto_flow.started_at > FLOW_TTL_SECONDS:
+            auto_flows.pop(user_id, None)
+            await update.effective_message.reply_text("自动回复设置已超时取消，请重新打开 /autoreply。")
+            return
+        if auto_flow.state == "template":
+            if not text or len(text) > 1000:
+                await update.effective_message.reply_text("模板不能为空，最多 1000 个字符；请重新发送。")
+                return
+            config = store.get_auto_reply_settings(user_id, auto_flow.account_id)
+            if not config:
+                auto_flows.pop(user_id, None)
+                await update.effective_message.reply_text("没有找到你的这个账号。")
+                return
+            config["scenes"][auto_flow.scene or "offline"] = text
+            store.save_auto_reply_config(user_id, auto_flow.account_id, config)
+            store.audit(user_id, "auto_reply_template_changed", auto_flow.account_id, f"scene={auto_flow.scene}")
+            auto_flows.pop(user_id, None)
+            await update.effective_message.reply_text("场景模板已保存。支持 {name}、{time}、{product}。", reply_markup=MENU)
+            return
+        if auto_flow.state == "product":
+            if len(text) > 120:
+                await update.effective_message.reply_text("产品/品牌名最多 120 个字符，请重新发送。")
+                return
+            config = store.get_auto_reply_settings(user_id, auto_flow.account_id)
+            if not config:
+                auto_flows.pop(user_id, None)
+                await update.effective_message.reply_text("没有找到你的这个账号。")
+                return
+            config["product"] = "" if text.strip().casefold() in {"清空", "clear", "-"} else text
+            store.save_auto_reply_config(user_id, auto_flow.account_id, config)
+            store.audit(user_id, "auto_reply_product_changed", auto_flow.account_id, "product updated")
+            auto_flows.pop(user_id, None)
+            await update.effective_message.reply_text("{product} 的替换内容已保存。", reply_markup=MENU)
+            return
+        if auto_flow.state == "thresholds":
+            parts = text.split()
+            try:
+                if len(parts) != 4:
+                    raise ValueError
+                idle, queue, start_hour, end_hour = map(int, parts)
+                if not 1 <= idle <= 1440 or not 1 <= queue <= 100 or not 0 <= start_hour <= 23 or not 0 <= end_hour <= 23:
+                    raise ValueError
+            except ValueError:
+                await update.effective_message.reply_text(
+                    "格式无效。请按“空闲分钟数 排队阈值 夜间开始小时 结束小时”填写，例如：15 3 23 9。"
+                )
+                return
+            config = store.get_auto_reply_settings(user_id, auto_flow.account_id)
+            if not config:
+                auto_flows.pop(user_id, None)
+                await update.effective_message.reply_text("没有找到你的这个账号。")
+                return
+            config.update({"idle_minutes": idle, "queue_threshold": queue, "start_hour": start_hour, "end_hour": end_hour})
+            store.save_auto_reply_config(user_id, auto_flow.account_id, config)
+            store.audit(user_id, "auto_reply_triggers_changed", auto_flow.account_id, "thresholds updated")
+            auto_flows.pop(user_id, None)
+            await update.effective_message.reply_text(
+                f"触发条件已保存：连续 {idle} 分钟无人工操作；未回复队列超过 {queue} 条；夜间 {start_hour:02d}:00–{end_hour:02d}:00。",
+                reply_markup=MENU,
+            )
+            return
     flow = flows.get(user_id)
     if not flow:
         await update.effective_message.reply_text("请选择菜单功能，或发送 /help。", reply_markup=MENU)
@@ -814,7 +892,9 @@ async def submit_2fa_password(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await require_private(update):
         return
-    await cleanup_flow(owner_id(update))
+    user = owner_id(update)
+    if auto_flows.pop(user, None) is None:
+        await cleanup_flow(user)
     await update.effective_message.reply_text("当前操作已取消。", reply_markup=MENU)
 
 
@@ -1229,6 +1309,222 @@ async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+def auto_account_picker(rows: list[dict[str, Any]]) -> InlineKeyboardMarkup:
+    keyboard = [[InlineKeyboardButton(format_account(row), callback_data=f"auto:acct:{row['id']}")] for row in rows]
+    keyboard.append([InlineKeyboardButton("手动切换全部账号自动", callback_data="auto:all")])
+    return InlineKeyboardMarkup(keyboard)
+
+
+def auto_settings_keyboard(account_id: int, enabled: bool, scene_mode: str) -> InlineKeyboardMarkup:
+    mode_label = "当前：自动分流（首次/夜间/忙碌）" if scene_mode == "auto" else "当前：成交/售后模式"
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("关闭自动回复" if enabled else "开启此账号自动回复", callback_data=f"auto:toggle:{account_id}")],
+            [InlineKeyboardButton("编辑场景话术", callback_data=f"auto:templates:{account_id}")],
+            [InlineKeyboardButton("设置触发条件", callback_data=f"auto:limits:{account_id}"),
+             InlineKeyboardButton("设置 {product}", callback_data=f"auto:product:{account_id}")],
+            [InlineKeyboardButton(mode_label + "（切换）", callback_data=f"auto:mode:{account_id}:{'sales' if scene_mode == 'auto' else 'auto'}")],
+            [InlineKeyboardButton("最近自动回复标记", callback_data=f"auto:recent:{account_id}")],
+            [InlineKeyboardButton("返回账号列表", callback_data="auto:list")],
+        ]
+    )
+
+
+def auto_scene_keyboard(account_id: int) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(label, callback_data=f"auto:edit:{account_id}:{scene}")]
+        for scene, label in SCENE_LABELS.items()
+    ]
+    rows.append([InlineKeyboardButton("返回设置", callback_data=f"auto:acct:{account_id}")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def auto_reply_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_private(update):
+        return
+    rows = store.list_accounts(owner_id(update))
+    if not rows:
+        await update.effective_message.reply_text("先添加本人账号，再为单个账号开启自动回复。", reply_markup=MENU)
+        return
+    await update.effective_message.reply_text(
+        "🤖 自动回复设置\n请选择账号。默认关闭；只处理私聊，不回复群组或机器人。收到的消息正文不会保存。",
+        reply_markup=auto_account_picker(rows),
+    )
+
+
+async def show_auto_reply_settings(message: Any, owner: int, account_id: int) -> None:
+    config = store.get_auto_reply_settings(owner, account_id)
+    row = store.get_account(owner, account_id)
+    if not config or not row:
+        await message.reply_text("没有找到你的这个账号。")
+        return
+    now = time.time()
+    reason = offline_reason(
+        config,
+        enabled=config["enabled"],
+        manual_auto=config["manual_auto"],
+        last_human_at=config["last_human_at"],
+        paused_until=config["paused_until"],
+        pending_count=config["pending_count"],
+        now=now,
+    )
+    local = local_datetime(now, config["tz_offset"])
+    status = "已开启" if config["enabled"] else "已关闭"
+    reason_labels = {"manual": "手动切换全部自动", "schedule": "夜间时段", "queue": "未回复队列超阈值", "idle": "空闲超时"}
+    active = f"当前离线触发：{reason_labels.get(reason, reason)}" if reason else "当前在线/未触发"
+    mode = "自动分流" if config["scene_mode"] == "auto" else "成交/售后"
+    await message.reply_text(
+        f"🤖 自动回复 · 账号 #{account_id}（{Store.mask_phone(row['phone'])}）\n"
+        f"状态：{status}；{active}\n"
+        f"人工活动：空闲 {config['idle_minutes']} 分钟触发；未回复队列 > {config['queue_threshold']} 条\n"
+        f"夜间：{config['start_hour']:02d}:00–{config['end_hour']:02d}:00（UTC{config['tz_offset']:+d}，现在 {local:%H:%M}）\n"
+        f"场景模式：{mode}；产品变量：{config['product'] or '未设置'}；当前未回复条数：{config['pending_count']}\n\n"
+        "人工从该账号发出消息后，会立即暂停自动回复并清除该联系人队列；暂停期间不触发自动回复。"
+        "夜间、空闲、队列和手动自动模式为 OR 关系。",
+        reply_markup=auto_settings_keyboard(account_id, config["enabled"], config["scene_mode"]),
+    )
+
+
+async def auto_reply_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query:
+        return
+    if not await require_private(update):
+        await query.answer("无权使用此机器人。", show_alert=True)
+        return
+    data = (query.data or "").split(":")
+    owner = owner_id(update)
+    if len(data) < 2 or data[0] != "auto":
+        await query.answer("按钮无效或已过期。", show_alert=True)
+        return
+    action = data[1]
+    await query.answer()
+    message = query.message
+    if action == "list":
+        if message:
+            rows = store.list_accounts(owner)
+            if rows:
+                await message.reply_text("请选择要设置的账号：", reply_markup=auto_account_picker(rows))
+            else:
+                await message.reply_text("目前没有已添加的账号。")
+        return
+    if action == "all":
+        count = store.set_auto_reply_all(owner, True)
+        store.audit(owner, "auto_reply_manual_all_on", None, f"accounts={count}")
+        for row in store.list_accounts(owner):
+            session = store.get_session(owner, row["id"])
+            if session:
+                start_monitor(owner, row["id"], session, context.application)
+        if message:
+            await message.reply_text(f"已将 {count} 个账号切换为手动自动模式。人工接管某个账号后，该账号会暂停。")
+        return
+    if len(data) < 3 or not data[2].isdigit():
+        if message:
+            await message.reply_text("账号选择无效或已过期。")
+        return
+    account_id = int(data[2])
+    config = store.get_auto_reply_settings(owner, account_id)
+    if not config:
+        if message:
+            await message.reply_text("没有找到你的这个账号。")
+        return
+    if action == "acct":
+        if message:
+            await show_auto_reply_settings(message, owner, account_id)
+        return
+    if action == "toggle":
+        enabled = not config["enabled"]
+        store.set_auto_reply_enabled(owner, account_id, enabled, manual_auto=False)
+        store.audit(owner, "auto_reply_enabled" if enabled else "auto_reply_disabled", account_id, "per-account setting")
+        if enabled:
+            session = store.get_session(owner, account_id)
+            if session:
+                start_monitor(owner, account_id, session, context.application)
+        else:
+            await stop_monitor_if_unused(owner, account_id)
+        if message:
+            await show_auto_reply_settings(message, owner, account_id)
+        return
+    if action == "templates":
+        if message:
+            await message.reply_text("选择要编辑的场景模板：", reply_markup=auto_scene_keyboard(account_id))
+        return
+    if action == "edit" and len(data) == 4 and data[3] in SCENE_LABELS:
+        auto_flows[owner] = AutoFlow(state="template", account_id=account_id, scene=data[3])
+        if message:
+            await message.reply_text(
+                f"请发送“{SCENE_LABELS[data[3]]}”模板（最多 1000 字）。"
+                "可用变量：{name}、{time}、{product}。发送 /cancel 取消。"
+            )
+        return
+    if action == "limits":
+        auto_flows[owner] = AutoFlow(state="thresholds", account_id=account_id)
+        if message:
+            await message.reply_text(
+                f"当前：空闲 {config['idle_minutes']} 分钟、队列阈值 {config['queue_threshold']}、"
+                f"夜间 {config['start_hour']:02d}:00–{config['end_hour']:02d}:00。\n"
+                "发送 4 个数字：空闲分钟数 队列阈值 夜间开始小时 结束小时；例如：15 3 23 9。"
+                "有效范围：空闲 1–1440 分钟、队列 1–100 条、小时 0–23。发送 /cancel 取消。"
+            )
+        return
+    if action == "product":
+        auto_flows[owner] = AutoFlow(state="product", account_id=account_id)
+        if message:
+            await message.reply_text("请发送 {product} 要替换成的产品/品牌名称（最多 120 字）；发送“清空”可移除。发送 /cancel 取消。")
+        return
+    if action == "mode" and len(data) == 4 and data[3] in {"auto", "sales"}:
+        config["scene_mode"] = data[3]
+        store.save_auto_reply_config(owner, account_id, config)
+        store.audit(owner, "auto_reply_scene_mode_changed", account_id, data[3])
+        if message:
+            await show_auto_reply_settings(message, owner, account_id)
+        return
+    if action == "recent":
+        items = store.list_auto_reply_messages(owner, account_id, 20)
+        if not items:
+            result = f"账号 #{account_id} 暂无自动回复记录。"
+        else:
+            lines = []
+            for item in items:
+                when = datetime.fromtimestamp(item["created_at"], timezone.utc).strftime("%m-%d %H:%M UTC")
+                label = SCENE_LABELS.get(item["scene"], item["scene"] or "离线")
+                lines.append(
+                    f"• auto=1 · 对话 {item['peer_id']} · Telegram 消息 #{item['message_id']} · {label} · {when}"
+                )
+            result = f"账号 #{account_id} 最近自动回复（正文未保存）：\n" + "\n".join(lines)
+        if message:
+            await message.reply_text(result)
+        return
+    return
+
+
+async def auto_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_private(update):
+        return
+    user = owner_id(update)
+    count = store.set_auto_reply_all(user, True)
+    for row in store.list_accounts(user):
+        session = store.get_session(user, row["id"])
+        if session:
+            start_monitor(user, row["id"], session, context.application)
+    store.audit(user, "auto_reply_manual_all_on", None, f"accounts={count}")
+    await update.effective_message.reply_text(
+        f"已将 {count} 个账号切换为手动自动模式。任一账号人工发消息后，该账号会立即暂停自动回复。",
+        reply_markup=MENU,
+    )
+
+
+async def auto_all_off(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_private(update):
+        return
+    user = owner_id(update)
+    count = store.set_auto_reply_all(user, False)
+    for row in store.list_accounts(user):
+        await stop_monitor_if_unused(user, row["id"])
+    store.audit(user, "auto_reply_all_off", None, f"accounts={count}")
+    await update.effective_message.reply_text(f"已关闭 {count} 个账号的自动回复。", reply_markup=MENU)
+
+
 async def notify_on(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await require_private(update):
         return
@@ -1246,24 +1542,140 @@ async def notify_off(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
     user = owner_id(update)
     store.set_alerts(user, False)
-    for key in list(monitors):
-        if key[0] == user:
-            client, task = monitors.pop(key)
+    for row in store.list_accounts(user):
+        await stop_monitor_if_unused(user, row["id"])
+    await update.effective_message.reply_text("安全通知已关闭。", reply_markup=MENU)
+
+
+async def stop_monitor_if_unused(user_id: int, account_id: int) -> None:
+    if store.alerts_enabled(user_id) or account_id in store.active_auto_reply_account_ids(user_id):
+        return
+    pair = (user_id, account_id)
+    if pair in monitors:
+        client, task = monitors.pop(pair)
+        if task and not task.done():
             task.cancel()
+        if client:
             try:
                 await client.disconnect()
             except Exception:
                 pass
-    await update.effective_message.reply_text("安全通知已关闭。", reply_markup=MENU)
 
 
 def start_monitor(user_id: int, account_id: int, session: str, application: Application) -> None:
     key = (user_id, account_id)
-    if key in monitors or not store.alerts_enabled(user_id):
+    auto_enabled = account_id in store.active_auto_reply_account_ids(user_id)
+    if key in monitors or not (store.alerts_enabled(user_id) or auto_enabled):
         return
     task = asyncio.create_task(watch_account(user_id, account_id, session, application, key))
     # A placeholder client is replaced as soon as the coroutine connects.
     monitors[key] = (None, task)  # type: ignore[arg-type]
+
+
+async def handle_auto_reply_event(event: Any, user_id: int, account_id: int, client: TelegramClient) -> None:
+    message = getattr(event, "message", None)
+    if not message or not getattr(event, "is_private", False):
+        return
+    try:
+        peer_id = int(event.chat_id)
+    except (TypeError, ValueError):
+        return
+    if peer_id == 777000:
+        return
+    marker_key = (account_id, peer_id)
+    if getattr(message, "out", False):
+        if marker_key in auto_sending_peers or store.is_auto_reply_message(user_id, account_id, peer_id, message.id):
+            return
+        store.record_auto_reply_human_outgoing(user_id, account_id, peer_id, message.id)
+        return
+
+    sender = None
+    try:
+        sender = await event.get_sender()
+    except Exception:
+        return
+    if getattr(sender, "bot", False) or not getattr(message, "id", None):
+        return
+
+    config = store.get_auto_reply_settings(user_id, account_id)
+    if not config or not config["enabled"]:
+        return
+    lock = auto_reply_locks.setdefault(marker_key, asyncio.Lock())
+    async with lock:
+        incoming = store.record_auto_reply_incoming(user_id, account_id, peer_id, message.id)
+        if not incoming["accepted"]:
+            return
+        now = time.time()
+        reason = offline_reason(
+            config,
+            enabled=config["enabled"],
+            manual_auto=config["manual_auto"],
+            last_human_at=config["last_human_at"],
+            paused_until=config["paused_until"],
+            pending_count=incoming["pending_count"],
+            now=now,
+        )
+        if reason is None:
+            return
+        local = local_datetime(now, config["tz_offset"])
+        local_day = local.strftime("%Y%m%d")
+        if not store.claim_auto_reply(
+            user_id,
+            account_id,
+            peer_id,
+            cooldown_seconds=config["cooldown_seconds"],
+            daily_cap=config["daily_cap"],
+            local_day=local_day,
+            now=now,
+        ):
+            return
+
+        try:
+            await asyncio.sleep(random.uniform(0.4, 1.2))
+            # Recheck after the short delay: a human may have taken over meanwhile.
+            latest = store.get_auto_reply_settings(user_id, account_id)
+            pending = store.auto_reply_pending_count(user_id, account_id)
+            if not latest:
+                store.release_auto_reply_claim(account_id, peer_id, claimed_at=now, local_day=local_day)
+                return
+            reason = offline_reason(
+                latest,
+                enabled=latest["enabled"],
+                manual_auto=latest["manual_auto"],
+                last_human_at=latest["last_human_at"],
+                paused_until=latest["paused_until"],
+                pending_count=pending,
+                now=time.time(),
+            )
+            if reason is None:
+                store.release_auto_reply_claim(account_id, peer_id, claimed_at=now, local_day=local_day)
+                return
+            scene = choose_scene(
+                latest,
+                first_contact=incoming["first_contact"],
+                manual_auto=latest["manual_auto"],
+                now=time.time(),
+            )
+            template = latest["scenes"].get(scene) or latest["scenes"].get("offline", "稍后回复你。")
+            name = " ".join(
+                part for part in [getattr(sender, "first_name", ""), getattr(sender, "last_name", "")] if part
+            ).strip() or "你好"
+            text = render_template(template, name=name, now=time.time(), config=latest)
+            if not text:
+                store.release_auto_reply_claim(account_id, peer_id, claimed_at=now, local_day=local_day)
+                return
+            auto_sending_peers.add(marker_key)
+            sent = await client.send_message(peer_id, text)
+            store.record_auto_reply_sent(user_id, account_id, peer_id, sent.id, scene)
+            store.audit(user_id, "auto_reply_sent", account_id, f"scene={scene}; reason={reason}")
+        except asyncio.CancelledError:
+            store.release_auto_reply_claim(account_id, peer_id, claimed_at=now, local_day=local_day)
+            raise
+        except Exception as exc:
+            store.release_auto_reply_claim(account_id, peer_id, claimed_at=now, local_day=local_day)
+            log.info("Automatic reply failed (%s)", type(exc).__name__)
+        finally:
+            auto_sending_peers.discard(marker_key)
 
 
 async def watch_account(user_id: int, account_id: int, session: str, application: Application, key: tuple[int, int]) -> None:
@@ -1286,7 +1698,12 @@ async def watch_account(user_id: int, account_id: int, session: str, application
                 except Exception:
                     pass
 
+        async def on_private_message(event: Any) -> None:
+            await handle_auto_reply_event(event, user_id, account_id, client)
+
         client.add_event_handler(on_service_message, events.NewMessage(from_users=777000, incoming=True))
+        client.add_event_handler(on_private_message, events.NewMessage(incoming=True))
+        client.add_event_handler(on_private_message, events.NewMessage(outgoing=True))
         await client.run_until_disconnected()
     except asyncio.CancelledError:
         raise
@@ -1351,7 +1768,7 @@ async def restore_account(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
     user, account_id = owner_id(update), int(context.args[0])
     ok = store.restore_account(user, account_id)
-    if ok and store.alerts_enabled(user):
+    if ok and (store.alerts_enabled(user) or account_id in store.active_auto_reply_account_ids(user)):
         session = store.get_session(user, account_id)
         if session:
             start_monitor(user, account_id, session, context.application)
@@ -1380,9 +1797,11 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/code — 仅在本人手机号登录流程中，点选同号的本人已保存账号后读取 Telegram 登录码\n"
         "/groups、/group_create 名称、/move 账号ID 分组名、/rename 账号ID 新备注\n/devices — 点选账号查看登录设备\n/2fa — 点选账号查看是否开启\n"
         "/search 关键词 — 搜索备注/号码/分组\n/notify_on、/notify_off — 安全通知\n/audit — 操作记录\n"
+        "/autoreply — 按账号设置离线自动回复；/auto_all — 手动切换全部账号自动；/auto_all_off — 全部关闭\n"
         "/delete 账号ID、/restore 账号ID — 回收站操作\n/consent — 确认理解登录托管风险\n/cancel — 取消当前流程\n\n"
         "安全边界：仅白名单用户可用且仅私聊；每位用户只能操作自己添加的账号；登录前必须同意运营者可访问会话。"
-        "账号转交、代替他人登录、群发消息、读取聊天内容及修改/查看 2FA 密码均不提供。",
+        "自动回复需逐号开启，只处理私聊、不回复群组；不会保存收到的消息正文，并有每人冷却和每日上限。"
+        "账号转交、代替他人登录及修改/查看 2FA 密码均不提供。",
         reply_markup=MENU,
     )
 
@@ -1393,13 +1812,16 @@ async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def on_startup(application: Application) -> None:
-    # Restore security-alert watchers after restart; session blobs are decrypted only in memory.
+    # Restore only the per-account watchers needed for security alerts or enabled auto replies.
     for user_id in store.active_owner_ids():
         if not is_allowed_user_id(user_id, ALLOWED_TELEGRAM_USER_IDS):
             continue
-        if not store.alerts_enabled(user_id):
+        auto_ids = set(store.active_auto_reply_account_ids(user_id))
+        if not store.alerts_enabled(user_id) and not auto_ids:
             continue
         for row in store.list_accounts(user_id):
+            if not store.alerts_enabled(user_id) and row["id"] not in auto_ids:
+                continue
             session = store.get_session(user_id, row["id"])
             if session:
                 start_monitor(user_id, row["id"], session, application)
@@ -1417,6 +1839,9 @@ async def on_shutdown(application: Application) -> None:
     monitors.clear()
     for user_id in list(flows):
         await cleanup_flow(user_id)
+    auto_flows.clear()
+    auto_reply_locks.clear()
+    auto_sending_peers.clear()
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1440,6 +1865,9 @@ def main() -> None:
     app.add_handler(CommandHandler("2fa", twofa))
     app.add_handler(CommandHandler("search", search_command))
     app.add_handler(CommandHandler("settings", settings))
+    app.add_handler(CommandHandler("autoreply", auto_reply_entry))
+    app.add_handler(CommandHandler("auto_all", auto_all))
+    app.add_handler(CommandHandler("auto_all_off", auto_all_off))
     app.add_handler(CommandHandler("notify_on", notify_on))
     app.add_handler(CommandHandler("notify_off", notify_off))
     app.add_handler(CommandHandler("audit", audit))
@@ -1451,6 +1879,7 @@ def main() -> None:
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CallbackQueryHandler(country_picker_callback, pattern=r"^ctry:"))
     app.add_handler(CallbackQueryHandler(account_picker_callback, pattern=r"^acctpick:"))
+    app.add_handler(CallbackQueryHandler(auto_reply_callback, pattern=r"^auto:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
     app.add_error_handler(error_handler)

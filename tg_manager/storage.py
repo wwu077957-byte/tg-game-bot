@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import math
 import os
 import sqlite3
@@ -11,6 +12,8 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from cryptography.fernet import Fernet, InvalidToken
+
+from .auto_reply import default_config, normalize_config
 
 
 AUTH_FAILURE_LIMIT = 5
@@ -26,7 +29,7 @@ PHONE_CODE_MIN_INTERVAL_SECONDS = 45
 class Store:
     """SQLite store; session blobs and identifying account metadata are Fernet-encrypted."""
 
-    METADATA_SCHEMA_VERSION = 2
+    METADATA_SCHEMA_VERSION = 3
 
     def __init__(self, db_path: str, encryption_key: str) -> None:
         if not encryption_key:
@@ -137,16 +140,54 @@ class Store:
                     next_attempt_at INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY(owner_id, phone_key)
                 );
+                CREATE TABLE IF NOT EXISTS auto_reply_settings (
+                    account_id INTEGER PRIMARY KEY,
+                    enabled INTEGER NOT NULL DEFAULT 0,
+                    manual_auto INTEGER NOT NULL DEFAULT 0,
+                    last_human_at REAL NOT NULL DEFAULT 0,
+                    paused_until REAL NOT NULL DEFAULT 0,
+                    config_cipher BLOB NOT NULL,
+                    FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
+                );
+                CREATE TABLE IF NOT EXISTS auto_reply_contacts (
+                    account_id INTEGER NOT NULL,
+                    peer_id INTEGER NOT NULL,
+                    first_seen_at REAL NOT NULL,
+                    last_inbound_at REAL NOT NULL,
+                    pending_count INTEGER NOT NULL DEFAULT 0,
+                    last_auto_reply_at REAL NOT NULL DEFAULT 0,
+                    daily_day TEXT NOT NULL DEFAULT '',
+                    daily_count INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY(account_id, peer_id),
+                    FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
+                );
+                CREATE TABLE IF NOT EXISTS auto_reply_messages (
+                    account_id INTEGER NOT NULL,
+                    peer_id INTEGER NOT NULL,
+                    message_id INTEGER NOT NULL,
+                    direction TEXT NOT NULL,
+                    auto INTEGER NOT NULL DEFAULT 0,
+                    scene TEXT NOT NULL DEFAULT '',
+                    created_at REAL NOT NULL,
+                    PRIMARY KEY(account_id, peer_id, message_id),
+                    FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS idx_auto_reply_messages_account_time
+                    ON auto_reply_messages(account_id, created_at DESC);
                 """
             )
             version = int(conn.execute("PRAGMA user_version").fetchone()[0])
-            if version < self.METADATA_SCHEMA_VERSION:
+            if version < 2:
                 self._encrypt_existing_metadata(conn)
-                conn.execute(f"PRAGMA user_version = {self.METADATA_SCHEMA_VERSION}")
+                conn.execute("PRAGMA user_version = 2")
                 conn.commit()
                 # Rewrite old plaintext pages left by the metadata conversion before startup.
                 conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
                 conn.execute("VACUUM")
+            if version < self.METADATA_SCHEMA_VERSION:
+                # Version 3 adds new tables only; do not encrypt v2 metadata again.
+                conn.execute(f"PRAGMA user_version = {self.METADATA_SCHEMA_VERSION}")
+                conn.commit()
             try:
                 os.chmod(self.db_path, 0o600)
             except OSError:
@@ -248,6 +289,315 @@ class Store:
             return self._fernet.decrypt(bytes(row["session_cipher"])).decode("utf-8")
         except (InvalidToken, ValueError) as exc:
             raise RuntimeError("Stored session could not be decrypted; check the configured encryption key") from exc
+
+    def _ensure_auto_reply_row(self, conn: sqlite3.Connection, account_id: int, now: float) -> None:
+        row = conn.execute("SELECT 1 FROM auto_reply_settings WHERE account_id = ?", (account_id,)).fetchone()
+        if not row:
+            payload = self._encrypt_text(json.dumps(default_config(), ensure_ascii=False))
+            conn.execute(
+                "INSERT INTO auto_reply_settings(account_id, config_cipher, last_human_at) VALUES(?,?,?)",
+                (account_id, payload, now),
+            )
+
+    def get_auto_reply_settings(self, owner_id: int, account_id: int) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT a.id, s.enabled, s.manual_auto, s.last_human_at, s.paused_until, s.config_cipher "
+                "FROM accounts a LEFT JOIN auto_reply_settings s ON s.account_id = a.id "
+                "WHERE a.owner_id = ? AND a.id = ? AND a.deleted_at IS NULL",
+                (owner_id, account_id),
+            ).fetchone()
+            if not row:
+                return None
+            saved = self._decrypt_text(row["config_cipher"]) if row["config_cipher"] is not None else "{}"
+        try:
+            config = normalize_config(json.loads(saved))
+        except (TypeError, ValueError):
+            config = default_config()
+        config.update(
+            {
+                "account_id": int(row["id"]),
+                "enabled": bool(row["enabled"]),
+                "manual_auto": bool(row["manual_auto"]),
+                "last_human_at": float(row["last_human_at"] or 0),
+                "paused_until": float(row["paused_until"] or 0),
+            }
+        )
+        config["pending_count"] = self.auto_reply_pending_count(owner_id, account_id)
+        return config
+
+    def save_auto_reply_config(self, owner_id: int, account_id: int, config: dict[str, Any]) -> bool:
+        normalized = normalize_config(config)
+        payload = self._encrypt_text(json.dumps(normalized, ensure_ascii=False))
+        now = time.time()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            account = conn.execute(
+                "SELECT 1 FROM accounts WHERE owner_id = ? AND id = ? AND deleted_at IS NULL",
+                (owner_id, account_id),
+            ).fetchone()
+            if not account:
+                return False
+            self._ensure_auto_reply_row(conn, account_id, now)
+            conn.execute("UPDATE auto_reply_settings SET config_cipher = ? WHERE account_id = ?", (payload, account_id))
+        return True
+
+    def set_auto_reply_enabled(
+        self,
+        owner_id: int,
+        account_id: int,
+        enabled: bool,
+        *,
+        manual_auto: bool | None = None,
+        now: float | None = None,
+    ) -> bool:
+        current = time.time() if now is None else float(now)
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            account = conn.execute(
+                "SELECT 1 FROM accounts WHERE owner_id = ? AND id = ? AND deleted_at IS NULL",
+                (owner_id, account_id),
+            ).fetchone()
+            if not account:
+                return False
+            self._ensure_auto_reply_row(conn, account_id, current)
+            if manual_auto is None:
+                conn.execute(
+                    "UPDATE auto_reply_settings SET enabled = ?, manual_auto = CASE WHEN ? = 0 THEN 0 ELSE manual_auto END, "
+                    "last_human_at = CASE WHEN ? = 1 THEN ? ELSE last_human_at END, "
+                    "paused_until = 0 WHERE account_id = ?",
+                    (int(enabled), int(enabled), int(enabled), current, account_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE auto_reply_settings SET enabled = ?, manual_auto = ?, "
+                    "last_human_at = CASE WHEN ? = 1 THEN ? ELSE last_human_at END, "
+                    "paused_until = 0 WHERE account_id = ?",
+                    (int(enabled), int(manual_auto), int(enabled), current, account_id),
+                )
+        return True
+
+    def set_auto_reply_all(self, owner_id: int, enabled: bool, *, now: float | None = None) -> int:
+        """Turn automatic replies on in manual-auto mode, or disable them for all active accounts."""
+        current = time.time() if now is None else float(now)
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            account_ids = [int(row[0]) for row in conn.execute(
+                "SELECT id FROM accounts WHERE owner_id = ? AND deleted_at IS NULL", (owner_id,)
+            ).fetchall()]
+            for account_id in account_ids:
+                self._ensure_auto_reply_row(conn, account_id, current)
+                if enabled:
+                    conn.execute(
+                        "UPDATE auto_reply_settings SET enabled = 1, manual_auto = 1, paused_until = 0, "
+                        "last_human_at = CASE WHEN last_human_at = 0 THEN ? ELSE last_human_at END "
+                        "WHERE account_id = ?",
+                        (current, account_id),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE auto_reply_settings SET enabled = 0, manual_auto = 0, paused_until = 0 "
+                        "WHERE account_id = ?",
+                        (account_id,),
+                    )
+        return len(account_ids)
+
+    def active_auto_reply_account_ids(self, owner_id: int) -> list[int]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT a.id FROM accounts a JOIN auto_reply_settings s ON s.account_id = a.id "
+                "WHERE a.owner_id = ? AND a.deleted_at IS NULL AND s.enabled = 1 ORDER BY a.id",
+                (owner_id,),
+            ).fetchall()
+        return [int(row[0]) for row in rows]
+
+    def record_auto_reply_incoming(
+        self, owner_id: int, account_id: int, peer_id: int, message_id: int, *, now: float | None = None
+    ) -> dict[str, Any]:
+        current = time.time() if now is None else float(now)
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT s.enabled FROM accounts a JOIN auto_reply_settings s ON s.account_id = a.id "
+                "WHERE a.owner_id = ? AND a.id = ? AND a.deleted_at IS NULL",
+                (owner_id, account_id),
+            ).fetchone()
+            if not row or not row["enabled"]:
+                return {"accepted": False, "first_contact": False, "pending_count": 0}
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO auto_reply_messages(account_id, peer_id, message_id, direction, auto, created_at) "
+                "VALUES(?,?,?,'in',0,?)",
+                (account_id, peer_id, message_id, current),
+            )
+            contact = conn.execute(
+                "SELECT pending_count FROM auto_reply_contacts WHERE account_id = ? AND peer_id = ?",
+                (account_id, peer_id),
+            ).fetchone()
+            if cur.rowcount == 0:
+                total = int(conn.execute(
+                    "SELECT COALESCE(SUM(pending_count),0) FROM auto_reply_contacts WHERE account_id = ?",
+                    (account_id,),
+                ).fetchone()[0])
+                return {"accepted": False, "first_contact": False, "pending_count": total}
+            first_contact = contact is None
+            if first_contact:
+                conn.execute(
+                    "INSERT INTO auto_reply_contacts(account_id, peer_id, first_seen_at, last_inbound_at, pending_count) "
+                    "VALUES(?,?,?,?,1)",
+                    (account_id, peer_id, current, current),
+                )
+            else:
+                conn.execute(
+                    "UPDATE auto_reply_contacts SET last_inbound_at = ?, pending_count = pending_count + 1 "
+                    "WHERE account_id = ? AND peer_id = ?",
+                    (current, account_id, peer_id),
+                )
+            total = int(conn.execute(
+                "SELECT COALESCE(SUM(pending_count),0) FROM auto_reply_contacts WHERE account_id = ?",
+                (account_id,),
+            ).fetchone()[0])
+            return {"accepted": True, "first_contact": first_contact, "pending_count": total}
+
+    def record_auto_reply_human_outgoing(
+        self, owner_id: int, account_id: int, peer_id: int, message_id: int, *, now: float | None = None
+    ) -> bool:
+        current = time.time() if now is None else float(now)
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT s.config_cipher, s.enabled FROM accounts a JOIN auto_reply_settings s ON s.account_id = a.id "
+                "WHERE a.owner_id = ? AND a.id = ? AND a.deleted_at IS NULL",
+                (owner_id, account_id),
+            ).fetchone()
+            if not row or not row["enabled"]:
+                return False
+            config = normalize_config(json.loads(self._decrypt_text(row["config_cipher"])))
+            pause_until = current + int(config["idle_minutes"]) * 60
+            inserted = conn.execute(
+                "INSERT OR IGNORE INTO auto_reply_messages(account_id, peer_id, message_id, direction, auto, created_at) "
+                "VALUES(?,?,?,'out',0,?)",
+                (account_id, peer_id, message_id, current),
+            )
+            if inserted.rowcount == 0:
+                return False
+            conn.execute(
+                "UPDATE auto_reply_settings SET last_human_at = ?, paused_until = ?, manual_auto = 0 WHERE account_id = ?",
+                (current, pause_until, account_id),
+            )
+            conn.execute(
+                "UPDATE auto_reply_contacts SET pending_count = 0 WHERE account_id = ? AND peer_id = ?",
+                (account_id, peer_id),
+            )
+        return True
+
+    def auto_reply_pending_count(self, owner_id: int, account_id: int) -> int:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COALESCE(SUM(c.pending_count),0) FROM auto_reply_contacts c "
+                "JOIN accounts a ON a.id = c.account_id "
+                "WHERE a.owner_id = ? AND a.id = ? AND a.deleted_at IS NULL",
+                (owner_id, account_id),
+            ).fetchone()
+        return int(row[0]) if row else 0
+
+    def claim_auto_reply(
+        self,
+        owner_id: int,
+        account_id: int,
+        peer_id: int,
+        *,
+        cooldown_seconds: int,
+        daily_cap: int,
+        local_day: str,
+        now: float | None = None,
+    ) -> bool:
+        current = time.time() if now is None else float(now)
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT s.enabled, s.paused_until, c.last_auto_reply_at, c.daily_day, c.daily_count "
+                "FROM accounts a JOIN auto_reply_settings s ON s.account_id = a.id "
+                "LEFT JOIN auto_reply_contacts c ON c.account_id = a.id AND c.peer_id = ? "
+                "WHERE a.owner_id = ? AND a.id = ? AND a.deleted_at IS NULL",
+                (peer_id, owner_id, account_id),
+            ).fetchone()
+            if not row or not row["enabled"] or float(row["paused_until"] or 0) > current:
+                return False
+            if current - float(row["last_auto_reply_at"] or 0) < max(60, int(cooldown_seconds)):
+                if float(row["last_auto_reply_at"] or 0) > 0:
+                    return False
+            today_count = int(row["daily_count"] or 0) if row["daily_day"] == local_day else 0
+            if today_count >= max(1, int(daily_cap)):
+                return False
+            conn.execute(
+                "UPDATE auto_reply_contacts SET last_auto_reply_at = ?, daily_day = ?, daily_count = ? "
+                "WHERE account_id = ? AND peer_id = ?",
+                (current, local_day, today_count + 1, account_id, peer_id),
+            )
+        return True
+
+    def release_auto_reply_claim(
+        self, account_id: int, peer_id: int, *, claimed_at: float, local_day: str
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "UPDATE auto_reply_contacts SET last_auto_reply_at = 0, daily_count = CASE "
+                "WHEN daily_day = ? AND daily_count > 0 THEN daily_count - 1 ELSE daily_count END "
+                "WHERE account_id = ? AND peer_id = ? AND last_auto_reply_at = ?",
+                (local_day, account_id, peer_id, claimed_at),
+            )
+
+    def record_auto_reply_sent(
+        self,
+        owner_id: int,
+        account_id: int,
+        peer_id: int,
+        message_id: int,
+        scene: str,
+        *,
+        now: float | None = None,
+    ) -> bool:
+        current = time.time() if now is None else float(now)
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            account = conn.execute(
+                "SELECT 1 FROM accounts WHERE owner_id = ? AND id = ? AND deleted_at IS NULL",
+                (owner_id, account_id),
+            ).fetchone()
+            if not account:
+                return False
+            conn.execute(
+                "INSERT OR REPLACE INTO auto_reply_messages(account_id, peer_id, message_id, direction, auto, scene, created_at) "
+                "VALUES(?,?,?,'out',1,?,?)",
+                (account_id, peer_id, message_id, scene, current),
+            )
+            conn.execute(
+                "UPDATE auto_reply_contacts SET pending_count = 0 WHERE account_id = ? AND peer_id = ?",
+                (account_id, peer_id),
+            )
+        return True
+
+    def is_auto_reply_message(self, owner_id: int, account_id: int, peer_id: int, message_id: int) -> bool:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM auto_reply_messages m JOIN accounts a ON a.id = m.account_id "
+                "WHERE a.owner_id = ? AND a.id = ? AND a.deleted_at IS NULL AND m.peer_id = ? "
+                "AND m.message_id = ? AND m.direction = 'out' AND m.auto = 1 LIMIT 1",
+                (owner_id, account_id, peer_id, message_id),
+            ).fetchone()
+        return bool(row)
+
+    def list_auto_reply_messages(self, owner_id: int, account_id: int, limit: int = 20) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT m.peer_id, m.message_id, m.scene, m.created_at FROM auto_reply_messages m "
+                "JOIN accounts a ON a.id = m.account_id WHERE a.owner_id = ? AND a.id = ? "
+                "AND a.deleted_at IS NULL AND m.direction = 'out' AND m.auto = 1 "
+                "ORDER BY m.created_at DESC LIMIT ?",
+                (owner_id, account_id, max(1, min(limit, 50))),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def update_label(self, owner_id: int, account_id: int, label: str) -> bool:
         with self._connect() as conn:
