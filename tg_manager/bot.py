@@ -15,6 +15,7 @@ from telegram import ReplyKeyboardMarkup, Update
 from telegram.ext import (
     Application,
     ApplicationBuilder,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -33,6 +34,7 @@ from telethon.sessions import StringSession
 
 from .storage import Store
 from .security import is_allowed_user_id, parse_allowed_user_ids
+from .picker import build_account_picker, parse_picker_callback
 
 load_dotenv()
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -502,35 +504,52 @@ async def code_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not await require_private(update):
         return
     user_id = owner_id(update)
-    rows = store.list_accounts(user_id)
-    if not rows:
-        await update.effective_message.reply_text("先用 /add 或 /qr 添加你本人的账号。", reply_markup=MENU)
-        return
     args = context.args
     if not args:
-        await update.effective_message.reply_text("获取哪个账号的最新验证码？发送 /code 账号ID。\n" + "\n".join(format_account(r) for r in rows))
+        await send_account_picker(update, "code")
         return
     try:
         account_id = int(args[0])
     except ValueError:
         await update.effective_message.reply_text("格式：/code 账号ID")
         return
+
+    await retrieve_login_code(user_id, account_id, update.effective_message, context.application)
+
+
+async def send_account_picker(update: Update, action: str) -> None:
+    user_id = owner_id(update)
+    rows = store.list_accounts(user_id)
+    if not rows:
+        await update.effective_message.reply_text("先用 /add 或 /qr 添加你本人的账号。", reply_markup=MENU)
+        return
+    titles = {
+        "code": "要从哪个账号读取验证码？",
+        "devices": "要查看哪个账号的登录设备？",
+        "twofa": "要查看哪个账号的 2FA 状态？",
+    }
+    await update.effective_message.reply_text(
+        titles[action], reply_markup=build_account_picker(rows, action, format_account)
+    )
+
+
+async def retrieve_login_code(user_id: int, account_id: int, message: Any, application: Application) -> None:
     session = store.get_session(user_id, account_id)
     row = store.get_account(user_id, account_id)
     if not session or not row:
-        await update.effective_message.reply_text("没有找到你的这个账号。")
+        await message.reply_text("没有找到你的这个账号。")
         return
     client = TelegramClient(StringSession(session), API_ID, API_HASH)
     try:
         await client.connect()
         if not await client.is_user_authorized():
-            await update.effective_message.reply_text("此会话已失效；请重新使用 /add 登录本人账号。")
+            await message.reply_text("此会话已失效；请重新使用 /add 登录本人账号。")
             return
         found: str | None = None
-        async for message in client.iter_messages(777000, limit=30):
-            if not message.date or (datetime.now(timezone.utc) - message.date).total_seconds() > 24 * 3600:
+        async for telegram_message in client.iter_messages(777000, limit=30):
+            if not telegram_message.date or (datetime.now(timezone.utc) - telegram_message.date).total_seconds() > 24 * 3600:
                 continue
-            body = (message.message or "").strip()
+            body = (telegram_message.message or "").strip()
             if re.search(r"login code|verification code|code for|код|验证码|登录码", body, re.I):
                 match = re.search(r"(?<!\d)(\d{5,6})(?!\d)", body)
                 if match:
@@ -538,16 +557,16 @@ async def code_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                     break
         store.audit(user_id, "login_code_checked", account_id, "service chat checked; code not stored")
         if found:
-            sent = await update.effective_message.reply_text(
+            sent = await message.reply_text(
                 f"账号 {Store.mask_phone(row['phone'])} 的最新 Telegram 验证码：\n{found}\n"
                 f"此码不会写入数据库，并将在约 {CODE_DISPLAY_TTL_SECONDS} 秒后尝试自动删除；请不要转发。",
             )
-            context.application.create_task(expire_displayed_code(sent))
+            application.create_task(expire_displayed_code(sent))
         else:
-            await update.effective_message.reply_text("未找到最近 24 小时内可识别的 Telegram 登录验证码。")
+            await message.reply_text("未找到最近 24 小时内可识别的 Telegram 登录验证码。")
     except Exception as exc:
         log.warning("Code retrieval failed (%s)", type(exc).__name__)
-        await update.effective_message.reply_text("读取失败。请确认账号登录会话有效，或直接在 Telegram 官方客户端查看。")
+        await message.reply_text("读取失败。请确认账号登录会话有效，或直接在 Telegram 官方客户端查看。")
     finally:
         await client.disconnect()
 
@@ -607,17 +626,21 @@ async def devices(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     user_id = owner_id(update)
     if not context.args:
-        rows = store.list_accounts(user_id)
-        await update.effective_message.reply_text("设备会话：发送 /devices 账号ID\n" + ("\n".join(format_account(r) for r in rows) or "暂无账号"))
+        await send_account_picker(update, "devices")
         return
     try:
         account_id = int(context.args[0])
     except ValueError:
         await update.effective_message.reply_text("格式：/devices 账号ID")
         return
+
+    await show_devices(user_id, account_id, update.effective_message)
+
+
+async def show_devices(user_id: int, account_id: int, message: Any) -> None:
     session = store.get_session(user_id, account_id)
     if not session:
-        await update.effective_message.reply_text("没有找到你的这个账号。")
+        await message.reply_text("没有找到你的这个账号。")
         return
     client = TelegramClient(StringSession(session), API_ID, API_HASH)
     try:
@@ -634,11 +657,11 @@ async def devices(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             current = "（本会话）" if getattr(auth, "current", False) else ""
             lines.append(f"• {device} {app} {country} · 最近活跃 {active} {current}".strip())
         store.audit(user_id, "devices_viewed", account_id, "authorization list")
-        await update.effective_message.reply_text("💻 Telegram 登录设备\n" + ("\n".join(lines) if lines else "未返回设备信息。") +
+        await message.reply_text("💻 Telegram 登录设备\n" + ("\n".join(lines) if lines else "未返回设备信息。") +
             "\n\n此 MVP 仅查看设备；撤销陌生会话请在 Telegram 官方设置中操作。", reply_markup=MENU)
     except Exception as exc:
         log.warning("Device listing failed (%s)", type(exc).__name__)
-        await update.effective_message.reply_text("无法读取设备列表；请检查会话是否仍有效。")
+        await message.reply_text("无法读取设备列表；请检查会话是否仍有效。")
     finally:
         await client.disconnect()
 
@@ -648,17 +671,20 @@ async def twofa(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     user_id = owner_id(update)
     if not context.args:
-        rows = store.list_accounts(user_id)
-        await update.effective_message.reply_text("2FA 状态：发送 /2fa 账号ID\n" + ("\n".join(format_account(r) for r in rows) or "暂无账号"))
+        await send_account_picker(update, "twofa")
         return
     try:
         account_id = int(context.args[0])
     except ValueError:
         await update.effective_message.reply_text("格式：/2fa 账号ID")
         return
+    await show_twofa(user_id, account_id, update.effective_message)
+
+
+async def show_twofa(user_id: int, account_id: int, message: Any) -> None:
     session = store.get_session(user_id, account_id)
     if not session:
-        await update.effective_message.reply_text("没有找到你的这个账号。")
+        await message.reply_text("没有找到你的这个账号。")
         return
     client = TelegramClient(StringSession(session), API_ID, API_HASH)
     try:
@@ -667,14 +693,14 @@ async def twofa(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         enabled = bool(getattr(result, "has_password", False))
         status = "已开启" if enabled else "未开启"
         store.audit(user_id, "twofa_status_checked", account_id, "status only")
-        await update.effective_message.reply_text(
+        await message.reply_text(
             f"🛡 该账号的两步验证：{status}。\n此 MVP 只读取状态，不读取或修改 2FA 密码。"
             "如需更改，请使用 Telegram 官方设置。" + ("建议开启强密码与恢复邮箱。" if not enabled else ""),
             reply_markup=MENU,
         )
     except Exception as exc:
         log.warning("2FA status check failed (%s)", type(exc).__name__)
-        await update.effective_message.reply_text("无法读取 2FA 状态；请检查会话是否有效。")
+        await message.reply_text("无法读取 2FA 状态；请检查会话是否有效。")
     finally:
         await client.disconnect()
 
@@ -684,6 +710,36 @@ async def search_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
     flows[owner_id(update)] = Flow(state="search")
     await update.effective_message.reply_text("发送手机号片段、备注或分组名进行搜索。/cancel 取消。")
+
+
+async def account_picker_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query:
+        return
+    if not await require_private(update):
+        await query.answer("无权使用此机器人。", show_alert=True)
+        return
+    parsed = parse_picker_callback(query.data)
+    if not parsed:
+        await query.answer("这个账号选择按钮无效或已过期。", show_alert=True)
+        return
+    action, account_id = parsed
+    await query.answer("正在查询…")
+    if query.message:
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+    message = query.message
+    if not message:
+        return
+    user_id = owner_id(update)
+    if action == "code":
+        await retrieve_login_code(user_id, account_id, message, context.application)
+    elif action == "devices":
+        await show_devices(user_id, account_id, message)
+    elif action == "twofa":
+        await show_twofa(user_id, account_id, message)
 
 
 async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -869,8 +925,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     await update.effective_message.reply_text(
         "命令说明\n"
-        "/accounts — 我的账号\n/add — 手机号验证码登录\n/qr — QR 登录\n/code 账号ID — 读取本人账号最近的 Telegram 登录码\n"
-        "/groups、/group_create 名称、/move 账号ID 分组名、/rename 账号ID 新备注\n/devices 账号ID — 查看登录设备\n/2fa 账号ID — 查看 2FA 是否开启\n"
+        "/accounts — 我的账号\n/add — 手机号验证码登录\n/qr — QR 登录\n/code — 点选本人账号后读取最近的 Telegram 登录码\n"
+        "/groups、/group_create 名称、/move 账号ID 分组名、/rename 账号ID 新备注\n/devices — 点选账号查看登录设备\n/2fa — 点选账号查看是否开启\n"
         "/search 关键词 — 搜索备注/号码/分组\n/notify_on、/notify_off — 安全通知\n/audit — 操作记录\n"
         "/delete 账号ID、/restore 账号ID — 回收站操作\n/consent — 确认理解登录托管风险\n/cancel — 取消当前流程\n\n"
         "安全边界：仅白名单用户可用且仅私聊；每位用户只能操作自己添加的账号；登录前必须同意运营者可访问会话。"
@@ -940,6 +996,7 @@ def main() -> None:
     app.add_handler(CommandHandler("rename", rename_account))
     app.add_handler(CommandHandler("cancel", cancel))
     app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CallbackQueryHandler(account_picker_callback, pattern=r"^acctpick:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
     app.add_error_handler(error_handler)

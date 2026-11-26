@@ -76,6 +76,6 @@ Bot 与 Telegram 之间的私聊仍受 Telegram 平台和客户端保护方式�
 
 ## 命令
 
-`/accounts`、`/add`、`/qr`、`/consent`、`/code 账号ID`、`/groups`、`/group_create 分组名`、`/move 账号ID 分组名`、`/rename 账号ID 新备注`、`/devices 账号ID`、`/2fa 账号ID`、`/search 关键词`、`/notify_on`、`/notify_off`、`/audit`、`/trash`、`/delete 账号ID`、`/restore 账号ID`、`/cancel`、`/help`。
+`/accounts`、`/add`、`/qr`、`/consent`、`/code`、`/groups`、`/group_create 分组名`、`/move 账号ID 分组名`、`/rename 账号ID 新备注`、`/devices`、`/2fa`、`/search 关键词`、`/notify_on`、`/notify_off`、`/audit`、`/trash`、`/delete 账号ID`、`/restore 账号ID`、`/cancel`、`/help`。点击“获取验证码”“设备会话”或“2FA 状态”后，会显示仅属于当前用户的账号按钮；点选即开始查询，无需输入账号 ID。也可直接发送 `/code`、`/devices` 或 `/2fa` 打开账号选择器；在命令后提供账号 ID 的旧用法仍可使用。
 
 当前代码仅为 MVP。本次部署会替换 Bot 功能，但不会自动完成主机隔离、备份方案、数据恢复演练或真实 Telegram 账号验证。
