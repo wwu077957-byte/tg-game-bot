@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from dotenv import load_dotenv
-from telegram import ReplyKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -21,7 +21,7 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
-from telethon import TelegramClient, events, functions
+from telethon import TelegramClient, events, functions, types
 from telethon.errors import (
     FloodWaitError,
     PasswordHashInvalidError,
@@ -35,6 +35,13 @@ from telethon.sessions import StringSession
 from .storage import Store
 from .security import is_allowed_user_id, parse_allowed_user_ids
 from .picker import build_account_picker, parse_picker_callback
+from .countries import (
+    PhoneInputError,
+    all_countries,
+    get_country,
+    normalize_phone_for_country,
+    search_countries,
+)
 
 load_dotenv()
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -66,15 +73,30 @@ class Flow:
     client: TelegramClient | None = None
     phone: str | None = None
     phone_code_hash: str | None = None
+    selected_country: str | None = None
+    country_matches: list[str] = field(default_factory=list)
+    country_page: int = 0
+    current_code_type: Any = None
+    next_code_type: Any = None
+    resend_ready_at: float = 0.0
+    resend_attempts: int = 0
     qr_login: Any = None
     task: asyncio.Task | None = None
     started_at: float = field(default_factory=time.monotonic)
 
 
+FLOW_TTL_SECONDS = 600
+
+
+def flow_is_expired(flow: Flow) -> bool:
+    return time.monotonic() - flow.started_at > FLOW_TTL_SECONDS
+
+
 flows: dict[int, Flow] = {}
 monitors: dict[tuple[int, int], tuple[TelegramClient, asyncio.Task]] = {}
-last_login_attempt: dict[int, float] = {}
+last_qr_login_attempt: dict[int, float] = {}
 LOGIN_COOLDOWN_SECONDS = max(30, int(os.getenv("LOGIN_COOLDOWN_SECONDS", "60")))
+COUNTRY_PAGE_SIZE = 8
 
 MENU = ReplyKeyboardMarkup(
     [
@@ -94,13 +116,108 @@ def is_private(update: Update) -> bool:
     return bool(update.effective_chat and update.effective_chat.type == "private" and update.effective_user)
 
 
-def consume_login_cooldown(user_id: int) -> int:
+def consume_qr_login_cooldown(user_id: int) -> int:
     now = time.monotonic()
-    remaining = LOGIN_COOLDOWN_SECONDS - (now - last_login_attempt.get(user_id, 0.0))
+    remaining = LOGIN_COOLDOWN_SECONDS - (now - last_qr_login_attempt.get(user_id, 0.0))
     if remaining > 0:
         return int(remaining) + 1
-    last_login_attempt[user_id] = now
+    last_qr_login_attempt[user_id] = now
     return 0
+
+
+def country_start_keyboard() -> InlineKeyboardMarkup:
+    buttons = [
+        ("美国 +1", "US"),
+        ("加拿大 +1", "CA"),
+        ("中国 +86", "CN"),
+        ("英国 +44", "GB"),
+    ]
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton(label, callback_data=f"ctry:select:{region}") for label, region in buttons[:2]],
+            [InlineKeyboardButton(label, callback_data=f"ctry:select:{region}") for label, region in buttons[2:]],
+            [InlineKeyboardButton("🔎 搜索国家/地区", callback_data="ctry:search")],
+            [InlineKeyboardButton("🌍 浏览全部国家/地区", callback_data="ctry:all:0")],
+        ]
+    )
+
+
+def country_results_keyboard(regions: list[str], page: int) -> InlineKeyboardMarkup:
+    total_pages = max(1, (len(regions) + COUNTRY_PAGE_SIZE - 1) // COUNTRY_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    start = page * COUNTRY_PAGE_SIZE
+    rows = []
+    for region in regions[start : start + COUNTRY_PAGE_SIZE]:
+        country = get_country(region)
+        if country:
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        f"{country.name} {country.calling_code}",
+                        callback_data=f"ctry:select:{country.region}",
+                    )
+                ]
+            )
+    navigation = []
+    if page > 0:
+        navigation.append(InlineKeyboardButton("‹ 上一页", callback_data=f"ctry:page:{page - 1}"))
+    if page + 1 < total_pages:
+        navigation.append(InlineKeyboardButton("下一页 ›", callback_data=f"ctry:page:{page + 1}"))
+    if navigation:
+        rows.append(navigation)
+    rows.append([InlineKeyboardButton("🔎 重新搜索", callback_data="ctry:search")])
+    return InlineKeyboardMarkup(rows)
+
+
+def phone_identity(phone: str) -> str:
+    return re.sub(r"\D", "", phone)
+
+
+def matching_saved_accounts(user_id: int, phone: str) -> list[dict[str, Any]]:
+    identity = phone_identity(phone)
+    return [row for row in store.list_accounts(user_id) if phone_identity(row["phone"]) == identity]
+
+
+def code_delivery_guidance(code_type: Any) -> str:
+    if isinstance(code_type, types.auth.SentCodeTypeApp):
+        return "投递方式：Telegram 官方服务消息。请检查该账号其他已登录设备上与 777000 的对话。"
+    if isinstance(code_type, types.auth.SentCodeTypeSms):
+        return "投递方式：短信。请检查此号码对应的 SIM 卡、垃圾短信/拦截箱及双卡收件卡槽。"
+    if isinstance(code_type, types.auth.SentCodeTypeCall):
+        return "投递方式：语音电话。请留意来电并按语音提示记录验证码。"
+    if isinstance(code_type, types.auth.SentCodeTypeFlashCall):
+        pattern = getattr(code_type, "pattern", "")
+        extra = f" Telegram 返回的来电号码匹配规则：{pattern}。" if pattern else ""
+        return "投递方式：闪呼，电话可能响一声后挂断；按 Telegram 要求核对来电号码。" + extra
+    if isinstance(code_type, types.auth.SentCodeTypeMissedCall):
+        return "投递方式：未接来电。请查看来电记录，并按 Telegram 要求取来电号码末尾数字作为验证码。"
+    if isinstance(code_type, types.auth.SentCodeTypeEmailCode):
+        pattern = getattr(code_type, "email_pattern", "")
+        destination = f" Telegram 显示的邮箱：{pattern}。" if pattern else " 请检查 Telegram 账号绑定的登录邮箱。"
+        return "投递方式：邮箱。" + destination
+    if isinstance(code_type, types.auth.SentCodeTypeSmsWord):
+        return "投递方式：短信单词码。请把短信中的单词原样作为验证码输入，不要改成数字。"
+    if isinstance(code_type, types.auth.SentCodeTypeSmsPhrase):
+        return "投递方式：短信短语码。请把短信中的完整短语原样输入。"
+    if isinstance(code_type, types.auth.SentCodeTypeFragmentSms):
+        return "投递方式：Telegram 指向 Fragment。此 Bot 不会访问或读取外部钱包/网站；请仅按 Telegram 官方客户端提示继续，或改用二维码登录。"
+    if isinstance(code_type, types.auth.SentCodeTypeFirebaseSms):
+        return "投递方式：官方移动端 Firebase 验证。该流程需要官方应用的设备完整性凭据，Bot 无法代办；若 Telegram 提供下一通道，可在等待后主动重发，否则请用官方客户端或二维码登录。"
+    if isinstance(code_type, types.auth.SentCodeTypeSetUpEmailRequired):
+        return "Telegram 要求先设置或验证登录邮箱；当前 Bot 不会代为设置邮箱。请在 Telegram 官方客户端完成后，再重新开始登录。"
+    return "Telegram 返回了此 Bot 未支持的验证码投递方式；请在 Telegram 官方客户端继续，或改用二维码登录。"
+
+
+def code_type_label(code_type: Any) -> str:
+    labels = {
+        "CodeTypeSms": "短信",
+        "CodeTypeCall": "语音电话",
+        "CodeTypeFlashCall": "闪呼",
+        "CodeTypeMissedCall": "未接来电",
+        "CodeTypeFragmentSms": "Fragment",
+    }
+    name = type(code_type).__name__
+    return labels.get(name, f"Telegram 返回的 {name} 通道")
 
 
 async def require_private(update: Update) -> bool:
@@ -214,9 +331,14 @@ async def qr_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "如理解并同意，请发送 /consent；否则发送 /cancel。"
         )
         return
-    wait_seconds = consume_login_cooldown(user_id)
+    wait_seconds = consume_qr_login_cooldown(user_id)
     if wait_seconds:
         await update.effective_message.reply_text(f"为避免触发 Telegram 登录限制，请约 {wait_seconds} 秒后再发起登录。")
+        await cleanup_flow(user_id)
+        return
+    wait_seconds = store.begin_auth_attempt(user_id, "code", account_phone="qr")
+    if wait_seconds:
+        await update.effective_message.reply_text(f"Telegram 要求二维码登录冷却，请再等约 {wait_seconds} 秒。")
         await cleanup_flow(user_id)
         return
     await cleanup_flow(user_id)
@@ -239,6 +361,10 @@ async def qr_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "如账号启用 2FA，扫描后会在此私聊要求输入密码。",
         )
         store.audit(user_id, "qr_login_started", None, "QR flow started")
+    except FloodWaitError as exc:
+        store.defer_auth_attempt(user_id, "code", exc.seconds, account_phone="qr")
+        await cleanup_flow(user_id)
+        await update.effective_message.reply_text(f"Telegram 要求等待 {exc.seconds} 秒；已记录等待时间，不会提前重试。")
     except Exception:
         await cleanup_flow(user_id)
         await update.effective_message.reply_text("无法启动二维码登录。请稍后重试，或使用 /add 通过手机号登录。")
@@ -253,15 +379,107 @@ async def consent_login(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.effective_message.reply_text("当前没有等待确认的登录流程。发送 /add 或 /qr 可开始。")
         return
     if flow.login_method == "phone":
-        flow.state = "phone"
+        flow.state = "country"
+        flow.country_matches = ["US", "CA", "CN", "GB"]
+        flow.country_page = 0
         flow.started_at = time.monotonic()
         await update.effective_message.reply_text(
-            "➕ 添加本人 Telegram 账号\n请发送手机号，使用国际格式（例如 +1... 或 +44...）。\n"
-            "只能添加你本人拥有并授权的账号。/cancel 可取消。"
+            "➕ 添加本人 Telegram 账号\n先选择号码所属国家/地区；也可以搜索中文名、英文名或国际区号。"
+            "美国与加拿大共用 +1，之后会按区号/号段再核对一次。\n只能添加你本人拥有并授权的账号。/cancel 可取消。",
+            reply_markup=country_start_keyboard(),
         )
         return
     flow.state = "qr_authorized"
     await qr_start(update, context)
+
+
+async def country_picker_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not query:
+        return
+    if not await require_private(update):
+        await query.answer("无权使用此机器人。", show_alert=True)
+        return
+    user_id = owner_id(update)
+    flow = flows.get(user_id)
+    data = query.data or ""
+    if flow and flow_is_expired(flow):
+        await cleanup_flow(user_id)
+        await query.answer("登录流程已过期，请重新发送 /add。", show_alert=True)
+        return
+    if not flow or (
+        flow.state not in {"country", "country_search", "country_results"}
+        and not (flow.state == "phone" and data == "ctry:change")
+    ):
+        await query.answer("国家选择已过期，请重新发送 /add。", show_alert=True)
+        return
+    if data == "ctry:change":
+        flow.state = "country"
+        flow.selected_country = None
+        flow.country_matches = ["US", "CA", "CN", "GB"]
+        flow.country_page = 0
+        await query.answer()
+        if query.message:
+            await query.edit_message_text(
+                "重新选择号码所属国家/地区；可以搜索中文名、英文名或国际区号。",
+                reply_markup=country_start_keyboard(),
+            )
+        return
+    if data == "ctry:search":
+        flow.state = "country_search"
+        await query.answer()
+        if query.message:
+            await query.edit_message_text("请发送国家/地区名称（中文或英文），也可以发送区号，例如 +1。/cancel 可取消。")
+        return
+    if data == "ctry:all:0":
+        flow.country_matches = [country.region for country in all_countries()]
+        flow.country_page = 0
+        flow.state = "country_results"
+        await query.answer()
+    elif data.startswith("ctry:page:"):
+        try:
+            page = int(data.rsplit(":", 1)[1])
+        except ValueError:
+            await query.answer("页面无效。", show_alert=True)
+            return
+        pages = max(1, (len(flow.country_matches) + COUNTRY_PAGE_SIZE - 1) // COUNTRY_PAGE_SIZE)
+        if page < 0 or page >= pages:
+            await query.answer("页面已过期，请重新搜索。", show_alert=True)
+            return
+        flow.country_page = page
+        await query.answer()
+    elif data.startswith("ctry:select:"):
+        region = data.rsplit(":", 1)[1].upper()
+        if flow.state not in {"country", "country_results"} or region not in flow.country_matches or not get_country(region):
+            await query.answer("国家选择无效或已过期。", show_alert=True)
+            return
+        country = get_country(region)
+        assert country is not None
+        flow.selected_country = region
+        flow.state = "phone"
+        flow.country_matches = []
+        flow.started_at = time.monotonic()
+        await query.answer("已选择")
+        if query.message:
+            await query.edit_message_text(
+                f"已选择：{country.name}（{country.calling_code}）。\n"
+                "请发送手机号，可输入本地格式，也可输入以 + 开头的完整国际号码。\n"
+                "号码会按所选国家/地区校验；/cancel 可取消。",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("更换国家/地区", callback_data="ctry:change")]]
+                ),
+            )
+        return
+    else:
+        await query.answer("按钮无效或已过期。", show_alert=True)
+        return
+
+    if query.message:
+        total_pages = max(1, (len(flow.country_matches) + COUNTRY_PAGE_SIZE - 1) // COUNTRY_PAGE_SIZE)
+        await query.edit_message_text(
+            f"请选择国家/地区（第 {flow.country_page + 1}/{total_pages} 页）：",
+            reply_markup=country_results_keyboard(flow.country_matches, flow.country_page),
+        )
 
 
 async def wait_for_qr(user_id: int, flow: Flow, application: Application) -> None:
@@ -277,6 +495,11 @@ async def wait_for_qr(user_id: int, flow: Flow, application: Application) -> Non
                 user_id,
                 "此账号启用了两步验证。请在此私聊发送 2FA 密码；系统不会保存该密码。处理后请删除聊天中的密码消息。",
             )
+    except FloodWaitError as exc:
+        if flows.get(user_id) is flow:
+            store.defer_auth_attempt(user_id, "code", exc.seconds, account_phone="qr")
+            await cleanup_flow(user_id)
+            await application.bot.send_message(user_id, f"Telegram 要求等待 {exc.seconds} 秒；已记录该等待时间，不会自动重试。")
     except asyncio.CancelledError:
         raise
     except Exception as exc:
@@ -306,7 +529,9 @@ async def finish_login(user_id: int, flow: Flow, application: Application, phone
         if not phone:
             raise RuntimeError("Telegram did not return an account phone number")
         session_string = StringSession.save(flow.client.session)
-        store.clear_auth_attempts(user_id)
+        auth_scope = flow.phone or "qr"
+        store.clear_auth_attempts(user_id, "code", auth_scope)
+        store.clear_auth_attempts(user_id, "password", auth_scope)
         account_id = store.add_account(user_id, phone, "", session_string)
         display = Store.mask_phone(phone)
         alerts = store.alerts_enabled(user_id)
@@ -352,12 +577,35 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not flow:
         await update.effective_message.reply_text("请选择菜单功能，或发送 /help。", reply_markup=MENU)
         return
-    if time.monotonic() - flow.started_at > 600:
+    if flow_is_expired(flow):
+        expired_state = flow.state
         await cleanup_flow(user_id)
-        await update.effective_message.reply_text("操作已超时取消，请重新开始。")
+        if expired_state in {"consent", "country", "country_search", "country_results", "phone", "code", "password", "qr_authorized", "qr_wait", "qr_password"}:
+            await update.effective_message.reply_text(
+                "登录流程已过期；旧验证码/登录请求不再继续使用。请重新发送 /add，或发送 /qr 并再次确认风险。"
+            )
+        else:
+            await update.effective_message.reply_text("操作已超时取消，请重新开始。")
         return
     if flow.state == "consent":
         await update.effective_message.reply_text("若你理解并接受上面的托管风险，请发送 /consent；否则发送 /cancel。")
+        return
+    if flow.state == "country_search":
+        matches = search_countries(text)
+        if not matches:
+            await update.effective_message.reply_text("没有找到匹配项。请换用中文名、英文名或区号搜索；/cancel 可取消。")
+            return
+        flow.country_matches = [country.region for country in matches]
+        flow.country_page = 0
+        flow.state = "country_results"
+        pages = max(1, (len(flow.country_matches) + COUNTRY_PAGE_SIZE - 1) // COUNTRY_PAGE_SIZE)
+        await update.effective_message.reply_text(
+            f"找到 {len(matches)} 个国家/地区（第 1/{pages} 页），请选择：",
+            reply_markup=country_results_keyboard(flow.country_matches, 0),
+        )
+        return
+    if flow.state in {"country", "country_results"}:
+        await update.effective_message.reply_text("请点选国家/地区按钮；如需搜索，请点“搜索国家/地区”。/cancel 可取消。")
         return
     if flow.state in {"code", "password", "qr_password"}:
         removed = await delete_user_input(update)
@@ -372,36 +620,96 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await submit_2fa_password(update, context, flow, secret)
         return
     if flow.state == "phone":
-        phone = text.replace(" ", "").replace("-", "")
-        if not re.fullmatch(r"\+[1-9]\d{7,14}", phone):
-            await update.effective_message.reply_text("手机号格式不正确。请使用 E.164 国际格式，例如 +447123456789。")
+        if not flow.selected_country:
+            flow.state = "country"
+            flow.country_matches = ["US", "CA", "CN", "GB"]
+            await update.effective_message.reply_text("请先选择号码所属国家/地区。", reply_markup=country_start_keyboard())
             return
-        wait_seconds = consume_login_cooldown(user_id)
+        try:
+            phone = normalize_phone_for_country(text, flow.selected_country)
+        except PhoneInputError as exc:
+            await update.effective_message.reply_text(
+                str(exc) + " 请检查号码或重新选择国家。",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("更换国家/地区", callback_data="ctry:change")]]
+                ),
+            )
+            return
+        await delete_user_input(update)
+        wait_seconds, request_count = store.reserve_phone_code_request(user_id, phone)
         if wait_seconds:
-            await update.effective_message.reply_text(f"为避免触发 Telegram 登录限制，请约 {wait_seconds} 秒后再试。")
+            await context.bot.send_message(
+                user_id,
+                f"这个号码的验证码请求仍在独立冷却中，请再等约 {wait_seconds} 秒。"
+                "为避免 Telegram 限流，不会提前重试；也可发送 /qr 改用二维码登录。",
+            )
             return
         flow.phone = phone
+        flow.resend_attempts = max(0, request_count - 1)
         client = TelegramClient(StringSession(), API_ID, API_HASH)
         flow.client = client
         try:
             await client.connect()
             result = await client.send_code_request(phone)
+            if isinstance(result, types.auth.SentCodePaymentRequired):
+                await cleanup_flow(user_id)
+                await context.bot.send_message(
+                    user_id,
+                    "Telegram 当前要求官方客户端完成额外步骤；Bot 不会处理付费或订阅。请使用官方客户端或二维码登录。",
+                )
+                return
+            if isinstance(result, types.auth.SentCodeSuccess):
+                await finish_login(user_id, flow, context.application)
+                return
+            if isinstance(getattr(result, "type", None), types.auth.SentCodeTypeSetUpEmailRequired):
+                guidance = code_delivery_guidance(result.type)
+                await cleanup_flow(user_id)
+                await context.bot.send_message(user_id, guidance + "完成后可重新发送 /add，或发送 /qr 并再次确认风险。")
+                return
+            if not getattr(result, "phone_code_hash", None):
+                raise RuntimeError("Telegram did not return a phone code hash")
             flow.phone_code_hash = result.phone_code_hash
+            flow.current_code_type = result.type
+            flow.next_code_type = result.next_type
             flow.state = "code"
-            await update.effective_message.reply_text(
-                f"Telegram 已向 {Store.mask_phone(phone)} 发送登录验证码（可能通过 Telegram 官方消息或短信）。\n"
-                "请在此私聊输入验证码。验证码会在处理后尝试删除，不会保存。/cancel 取消。"
-            )
+            flow.started_at = time.monotonic()
+            delivery = code_delivery_guidance(result.type)
+            message = f"Telegram 为 {Store.mask_phone(phone)} 返回的验证码投递方式：\n{delivery}\n\n"
+            message += "如果此方式已送达，请在此私聊按提示输入验证码；验证码会在处理后尝试删除，不会保存。"
+            if result.next_type is not None:
+                delay = max(45, int(result.timeout or 0))
+                flow.resend_ready_at = time.monotonic() + delay
+                store.defer_phone_code_request(user_id, phone, delay)
+                message += (
+                    f"\n\nTelegram 提供的下一种通道是：{code_type_label(result.next_type)}。"
+                    f"返回的等待时间为 {int(result.timeout or 0)} 秒；本 Bot 至少等待 45 秒。"
+                    "若仍未收到，等候结束后由你主动发送 /resend；最多再发送 4 次，不会自动连续重发。"
+                )
+            else:
+                flow.resend_ready_at = 0.0
+                message += "\n\nTelegram 未返回可用的下一通道；本 Bot 不会强制切换，请发送 /qr 使用二维码登录。"
+            markup = None
+            if isinstance(result.type, types.auth.SentCodeTypeApp):
+                matching = matching_saved_accounts(user_id, phone)
+                if matching:
+                    markup = build_account_picker(matching, "code", format_account)
+                    message += "\n\n如需从本人已保存的同号会话读取 777000，请明确点选下方按钮；不会自动读取。"
+            await context.bot.send_message(user_id, message + "\n/cancel 取消。", reply_markup=markup)
         except PhoneNumberInvalidError:
             await cleanup_flow(user_id)
-            await update.effective_message.reply_text("Telegram 判定手机号无效；请检查号码后重新发送 /add。")
+            await context.bot.send_message(user_id, "Telegram 判定号码无效；请重新发送 /add 并核对国家和号码。该号码冷却仍会生效。")
         except FloodWaitError as exc:
+            store.defer_phone_code_request(user_id, phone, exc.seconds)
             await cleanup_flow(user_id)
-            await update.effective_message.reply_text(f"Telegram 暂时限制了登录请求，请在约 {exc.seconds} 秒后重试。")
+            await context.bot.send_message(
+                user_id,
+                f"Telegram 要求等待 {exc.seconds} 秒；已为这个号码记录该等待时间，不会提前重试。"
+                "等待结束后可发送 /add 重试，或发送 /qr 改用二维码登录。",
+            )
         except Exception as exc:
             log.warning("Phone login initialization failed (%s)", type(exc).__name__)
             await cleanup_flow(user_id)
-            await update.effective_message.reply_text("无法发起登录请求。请检查 Telegram API 配置、网络和账号状态。")
+            await context.bot.send_message(user_id, "无法发起登录请求。请检查 Telegram API 配置、网络和账号状态；也可发送 /qr。")
         return
     if flow.state == "search":
         flows.pop(user_id, None)
@@ -423,7 +731,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 async def submit_login_code(update: Update, context: ContextTypes.DEFAULT_TYPE, flow: Flow, code: str) -> None:
     user_id = owner_id(update)
-    wait_seconds = store.begin_auth_attempt(user_id, "code")
+    if not flow.phone:
+        await cleanup_flow(user_id)
+        await context.bot.send_message(user_id, "手机号登录流程已失效，请重新发送 /add；或发送 /qr 使用二维码登录。")
+        return
+    wait_seconds = store.begin_auth_attempt(user_id, "code", account_phone=flow.phone)
     if wait_seconds:
         await context.bot.send_message(user_id, f"验证码尝试正在冷却，请约 {wait_seconds} 秒后再试。")
         return
@@ -433,7 +745,7 @@ async def submit_login_code(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         await flow.client.sign_in(phone=flow.phone, code=code, phone_code_hash=flow.phone_code_hash)
         await finish_login(user_id, flow, context.application)
     except SessionPasswordNeededError:
-        store.clear_auth_attempts(user_id, "code")
+        store.clear_auth_attempts(user_id, "code", flow.phone)
         flow.state = "password"
         flow.started_at = time.monotonic()
         await context.bot.send_message(
@@ -441,7 +753,7 @@ async def submit_login_code(update: Update, context: ContextTypes.DEFAULT_TYPE, 
             "此账号启用了两步验证。请发送 2FA 密码以继续；它只用于本次登录，不会保存。处理后请删除聊天中的密码消息。",
         )
     except PhoneCodeInvalidError:
-        wait_seconds = store.record_auth_failure(user_id, "code")
+        wait_seconds = store.record_auth_failure(user_id, "code", account_phone=flow.phone)
         if wait_seconds:
             await cleanup_flow(user_id)
             await context.bot.send_message(
@@ -451,12 +763,14 @@ async def submit_login_code(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         else:
             await context.bot.send_message(user_id, "验证码不正确。每次尝试间至少冷却 5 秒；达到上限后会暂时锁定。")
     except PhoneCodeExpiredError:
-        store.clear_auth_attempts(user_id, "code")
+        store.clear_auth_attempts(user_id, "code", flow.phone)
         await cleanup_flow(user_id)
         await context.bot.send_message(user_id, "验证码已过期，发送 /add 获取新的验证码。")
     except FloodWaitError as exc:
+        store.defer_auth_attempt(user_id, "code", exc.seconds, account_phone=flow.phone)
+        store.defer_phone_code_request(user_id, flow.phone, exc.seconds)
         await cleanup_flow(user_id)
-        await context.bot.send_message(user_id, f"Telegram 暂时限制了登录请求，请在约 {exc.seconds} 秒后重试。")
+        await context.bot.send_message(user_id, f"Telegram 要求等待 {exc.seconds} 秒；已为该号码记录等待时间，不会提前重试。")
     except Exception as exc:
         log.warning("Phone code sign-in failed (%s)", type(exc).__name__)
         await cleanup_flow(user_id)
@@ -465,7 +779,10 @@ async def submit_login_code(update: Update, context: ContextTypes.DEFAULT_TYPE, 
 
 async def submit_2fa_password(update: Update, context: ContextTypes.DEFAULT_TYPE, flow: Flow, password: str) -> None:
     user_id = owner_id(update)
-    wait_seconds = store.begin_auth_attempt(user_id, "password")
+    # Telethon does not expose the QR target account before authorization completes;
+    # share a conservative owner-scoped QR lock instead of letting new QR tokens bypass it.
+    auth_scope = flow.phone or "qr"
+    wait_seconds = store.begin_auth_attempt(user_id, "password", account_phone=auth_scope)
     if wait_seconds:
         await context.bot.send_message(user_id, f"2FA 尝试正在冷却，请约 {wait_seconds} 秒后再试。")
         return
@@ -475,7 +792,7 @@ async def submit_2fa_password(update: Update, context: ContextTypes.DEFAULT_TYPE
         await flow.client.sign_in(password=password)
         await finish_login(user_id, flow, context.application)
     except PasswordHashInvalidError:
-        wait_seconds = store.record_auth_failure(user_id, "password")
+        wait_seconds = store.record_auth_failure(user_id, "password", account_phone=auth_scope)
         if wait_seconds:
             await cleanup_flow(user_id)
             await context.bot.send_message(
@@ -485,8 +802,9 @@ async def submit_2fa_password(update: Update, context: ContextTypes.DEFAULT_TYPE
         else:
             await context.bot.send_message(user_id, "2FA 密码不正确。每次尝试间至少冷却 5 秒；达到上限后会暂时锁定。/cancel 可取消。")
     except FloodWaitError as exc:
+        store.defer_auth_attempt(user_id, "password", exc.seconds, account_phone=auth_scope)
         await cleanup_flow(user_id)
-        await context.bot.send_message(user_id, f"Telegram 暂时限制了登录请求，请在约 {exc.seconds} 秒后重试。")
+        await context.bot.send_message(user_id, f"Telegram 要求等待 {exc.seconds} 秒；已记录该账号等待时间，不会提前重试。")
     except Exception as exc:
         log.warning("2FA sign-in failed (%s)", type(exc).__name__)
         await cleanup_flow(user_id)
@@ -498,6 +816,97 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     await cleanup_flow(owner_id(update))
     await update.effective_message.reply_text("当前操作已取消。", reply_markup=MENU)
+
+
+async def resend_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_private(update):
+        return
+    user_id = owner_id(update)
+    flow = flows.get(user_id)
+    if flow and flow_is_expired(flow):
+        await cleanup_flow(user_id)
+        await update.effective_message.reply_text(
+            "登录流程已过期，不能继续重发旧验证码。请重新发送 /add，或发送 /qr 并再次确认风险。"
+        )
+        return
+    if not flow or flow.state != "code" or not flow.client or not flow.phone or not flow.phone_code_hash:
+        await update.effective_message.reply_text("当前没有可重发的手机号验证码。请发送 /add，或发送 /qr 使用二维码登录。")
+        return
+    if flow.next_code_type is None:
+        await update.effective_message.reply_text("Telegram 没有返回可用的下一通道，不能重发或强制切换；请发送 /qr。")
+        return
+    if flow.resend_attempts >= 4:
+        await update.effective_message.reply_text(
+            "已达到最多 4 次显式重发。若当前验证码仍有效可继续输入；否则请发送 /qr，或稍后重新开始。"
+        )
+        return
+    remaining = flow.resend_ready_at - time.monotonic()
+    if remaining > 0:
+        await update.effective_message.reply_text(f"Telegram 要求先等待；约 {int(remaining) + 1} 秒后可发送 /resend。")
+        return
+
+    wait_seconds, _request_count = store.reserve_phone_code_request(user_id, flow.phone)
+    if wait_seconds:
+        flow.resend_ready_at = max(flow.resend_ready_at, time.monotonic() + wait_seconds)
+        await update.effective_message.reply_text(f"这个号码仍在独立冷却中，请再等约 {wait_seconds} 秒。")
+        return
+    flow.resend_attempts += 1
+    try:
+        result = await flow.client(functions.auth.ResendCodeRequest(flow.phone, flow.phone_code_hash))
+        if isinstance(result, types.auth.SentCodeSuccess):
+            await finish_login(user_id, flow, context.application)
+            return
+        if isinstance(result, types.auth.SentCodePaymentRequired):
+            await cleanup_flow(user_id)
+            await context.bot.send_message(user_id, "Telegram 当前要求官方客户端完成额外步骤；Bot 不会处理付费或订阅。请改用官方客户端或二维码登录。")
+            return
+        if isinstance(getattr(result, "type", None), types.auth.SentCodeTypeSetUpEmailRequired):
+            guidance = code_delivery_guidance(result.type)
+            await cleanup_flow(user_id)
+            await context.bot.send_message(user_id, guidance + "完成后可重新发送 /add，或发送 /qr 并再次确认风险。")
+            return
+        if not getattr(result, "phone_code_hash", None) or not hasattr(result, "type"):
+            raise RuntimeError("Telegram returned an unsupported resend result")
+        flow.phone_code_hash = result.phone_code_hash
+        flow.current_code_type = result.type
+        flow.next_code_type = result.next_type
+        flow.started_at = time.monotonic()
+        delivery = code_delivery_guidance(result.type)
+        message = f"Telegram 返回的当前验证码投递方式：\n{delivery}\n\n"
+        message += "若此方式已送达，请在此私聊输入收到的验证码；验证码会在处理后尝试删除，不会保存。"
+        markup = None
+        if isinstance(result.type, types.auth.SentCodeTypeApp):
+            matching = matching_saved_accounts(user_id, flow.phone)
+            if matching:
+                markup = build_account_picker(matching, "code", format_account)
+                message += "\n\n如需从本人已保存的同号会话读取 777000，请明确点选下方按钮；不会自动读取。"
+        if result.next_type is not None:
+            delay = max(45, int(result.timeout or 0))
+            flow.resend_ready_at = time.monotonic() + delay
+            store.defer_phone_code_request(user_id, flow.phone, delay)
+            message += (
+                f"\n\nTelegram 提供的下一通道：{code_type_label(result.next_type)}；"
+                f"返回等待 {int(result.timeout or 0)} 秒，本 Bot 至少等待 45 秒。"
+                "如仍未收到，请在等待结束后主动 /resend。"
+            )
+        else:
+            flow.resend_ready_at = 0.0
+            message += "\n\nTelegram 未提供下一通道；不再重发，请发送 /qr。"
+        await context.bot.send_message(user_id, message + "\n/cancel 取消。", reply_markup=markup)
+    except FloodWaitError as exc:
+        store.defer_phone_code_request(user_id, flow.phone, exc.seconds)
+        flow.resend_ready_at = time.monotonic() + max(45, int(exc.seconds))
+        await context.bot.send_message(
+            user_id,
+            f"Telegram 要求等待 {exc.seconds} 秒；已记录该等待时间。此流程不会自动重试，等待结束后你可再发 /resend。",
+        )
+    except PhoneCodeExpiredError:
+        await cleanup_flow(user_id)
+        await context.bot.send_message(user_id, "验证码已过期，请重新发送 /add；也可发送 /qr。手机号冷却与重发上限仍会生效。")
+    except Exception as exc:
+        log.warning("Explicit code resend failed (%s)", type(exc).__name__)
+        await cleanup_flow(user_id)
+        await context.bot.send_message(user_id, "Telegram 未能完成这次重发。为避免重复请求，登录流程已停止；请发送 /qr。")
 
 
 async def code_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -520,6 +929,29 @@ async def code_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def send_account_picker(update: Update, action: str) -> None:
     user_id = owner_id(update)
     rows = store.list_accounts(user_id)
+    if action == "code":
+        flow = flows.get(user_id)
+        if flow and flow_is_expired(flow):
+            await cleanup_flow(user_id)
+            await update.effective_message.reply_text(
+                "手机号登录流程已过期；为保护验证码，不再读取旧流程中的 777000 消息。请重新发送 /add。"
+            )
+            return
+        if (
+            not flow
+            or flow.state != "code"
+            or not flow.phone
+            or not isinstance(flow.current_code_type, types.auth.SentCodeTypeApp)
+        ):
+            await update.effective_message.reply_text(
+                "为保护验证码，只有本人正在进行手机号登录、且 Telegram 当前返回应用内投递方式时，"
+                "才可主动查询同号账号的 777000 消息。请确认当前流程或重新发送 /add。"
+            )
+            return
+        rows = matching_saved_accounts(user_id, flow.phone)
+        if not rows:
+            await update.effective_message.reply_text("没有找到属于你且号码完全匹配的已保存会话；不会查询其他账号。")
+            return
     if not rows:
         await update.effective_message.reply_text("先用 /add 或 /qr 添加你本人的账号。", reply_markup=MENU)
         return
@@ -534,9 +966,27 @@ async def send_account_picker(update: Update, action: str) -> None:
 
 
 async def retrieve_login_code(user_id: int, account_id: int, message: Any, application: Application) -> None:
-    session = store.get_session(user_id, account_id)
+    flow = flows.get(user_id)
+    if flow and flow_is_expired(flow):
+        await cleanup_flow(user_id)
+        await message.reply_text(
+            "手机号登录流程已过期；为保护验证码，不再读取旧流程中的 777000 消息。请重新发送 /add。"
+        )
+        return
     row = store.get_account(user_id, account_id)
-    if not session or not row:
+    if (
+        not flow
+        or flow.state != "code"
+        or not flow.phone
+        or not isinstance(flow.current_code_type, types.auth.SentCodeTypeApp)
+    ):
+        await message.reply_text("验证码读取仅可在你本人当前的手机号登录流程中主动发起。请发送 /add。")
+        return
+    if not row or phone_identity(row["phone"]) != phone_identity(flow.phone):
+        await message.reply_text("所选账号不属于当前手机号登录流程的同号账号；为保护隔离，没有读取验证码。")
+        return
+    session = store.get_session(user_id, account_id)
+    if not session:
         await message.reply_text("没有找到你的这个账号。")
         return
     client = TelegramClient(StringSession(session), API_ID, API_HASH)
@@ -925,7 +1375,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     await update.effective_message.reply_text(
         "命令说明\n"
-        "/accounts — 我的账号\n/add — 手机号验证码登录\n/qr — QR 登录\n/code — 点选本人账号后读取最近的 Telegram 登录码\n"
+        "/accounts — 我的账号\n/add — 先同意风险，再搜索/选择国家并输入号码进行手机号登录\n/qr — QR 登录\n"
+        "/resend — 仅在 Telegram 返回 next_type、等待结束后主动重发；最多 4 次，不自动连发\n"
+        "/code — 仅在本人手机号登录流程中，点选同号的本人已保存账号后读取 Telegram 登录码\n"
         "/groups、/group_create 名称、/move 账号ID 分组名、/rename 账号ID 新备注\n/devices — 点选账号查看登录设备\n/2fa — 点选账号查看是否开启\n"
         "/search 关键词 — 搜索备注/号码/分组\n/notify_on、/notify_off — 安全通知\n/audit — 操作记录\n"
         "/delete 账号ID、/restore 账号ID — 回收站操作\n/consent — 确认理解登录托管风险\n/cancel — 取消当前流程\n\n"
@@ -980,6 +1432,7 @@ def main() -> None:
     app.add_handler(CommandHandler("qr", qr_start))
     app.add_handler(CommandHandler("consent", consent_login))
     app.add_handler(CommandHandler("code", code_command))
+    app.add_handler(CommandHandler("resend", resend_code))
     app.add_handler(CommandHandler("groups", groups))
     app.add_handler(CommandHandler("group_create", group_create))
     app.add_handler(CommandHandler("move", move_account))
@@ -996,6 +1449,7 @@ def main() -> None:
     app.add_handler(CommandHandler("rename", rename_account))
     app.add_handler(CommandHandler("cancel", cancel))
     app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CallbackQueryHandler(country_picker_callback, pattern=r"^ctry:"))
     app.add_handler(CallbackQueryHandler(account_picker_callback, pattern=r"^acctpick:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.COMMAND, unknown_command))

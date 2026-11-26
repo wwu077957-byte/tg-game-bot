@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
 import math
 import os
 import sqlite3
@@ -12,9 +14,13 @@ from cryptography.fernet import Fernet, InvalidToken
 
 
 AUTH_FAILURE_LIMIT = 5
+AUTH_PASSWORD_FAILURE_LIMIT = 3
 AUTH_FAILURE_WINDOW_SECONDS = 15 * 60
 AUTH_LOCKOUT_SECONDS = 5 * 60
 AUTH_MIN_INTERVAL_SECONDS = 5
+PHONE_CODE_REQUEST_LIMIT = 5
+PHONE_CODE_REQUEST_WINDOW_SECONDS = 15 * 60
+PHONE_CODE_MIN_INTERVAL_SECONDS = 45
 
 
 class Store:
@@ -27,6 +33,7 @@ class Store:
             raise RuntimeError("SESSION_ENCRYPTION_KEY is required; refusing plaintext session storage")
         try:
             self._fernet = Fernet(encryption_key.encode("ascii"))
+            self._scope_key = encryption_key.encode("ascii")
         except Exception as exc:
             raise RuntimeError("SESSION_ENCRYPTION_KEY must be a valid Fernet key") from exc
         os.umask(0o077)
@@ -111,6 +118,24 @@ class Store:
                     cooldown_until INTEGER NOT NULL DEFAULT 0,
                     next_attempt_at INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY(owner_id, purpose)
+                );
+                CREATE TABLE IF NOT EXISTS auth_attempts_scoped (
+                    owner_id INTEGER NOT NULL,
+                    purpose TEXT NOT NULL,
+                    phone_key TEXT NOT NULL,
+                    failures INTEGER NOT NULL DEFAULT 0,
+                    window_started_at INTEGER NOT NULL,
+                    cooldown_until INTEGER NOT NULL DEFAULT 0,
+                    next_attempt_at INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY(owner_id, purpose, phone_key)
+                );
+                CREATE TABLE IF NOT EXISTS phone_code_limits (
+                    owner_id INTEGER NOT NULL,
+                    phone_key TEXT NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    window_started_at INTEGER NOT NULL,
+                    next_attempt_at INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY(owner_id, phone_key)
                 );
                 """
             )
@@ -335,11 +360,15 @@ class Store:
             result.append(row)
         return result
 
-    def begin_auth_attempt(self, owner_id: int, purpose: str, now: int | None = None) -> int:
+    def begin_auth_attempt(
+        self, owner_id: int, purpose: str, now: int | None = None, account_phone: str | None = None
+    ) -> int:
         """Reserve an attempt if allowed; return seconds remaining in cooldown otherwise."""
         if purpose not in {"code", "password"}:
             raise ValueError("Unsupported authentication purpose")
         current = int(time.time()) if now is None else int(now)
+        if account_phone is not None:
+            return self._begin_scoped_auth_attempt(owner_id, purpose, account_phone, current)
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
@@ -367,11 +396,15 @@ class Store:
             )
         return 0
 
-    def record_auth_failure(self, owner_id: int, purpose: str, now: int | None = None) -> int:
+    def record_auth_failure(
+        self, owner_id: int, purpose: str, now: int | None = None, account_phone: str | None = None
+    ) -> int:
         """Count a rejected code/password; lock that purpose after the failure limit."""
         if purpose not in {"code", "password"}:
             raise ValueError("Unsupported authentication purpose")
         current = int(time.time()) if now is None else int(now)
+        if account_phone is not None:
+            return self._record_scoped_auth_failure(owner_id, purpose, account_phone, current)
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
@@ -382,7 +415,8 @@ class Store:
             expired = not row or current - row["window_started_at"] >= AUTH_FAILURE_WINDOW_SECONDS
             failures = (0 if expired else int(row["failures"])) + 1
             window_started = current if expired else int(row["window_started_at"])
-            cooldown_until = current + AUTH_LOCKOUT_SECONDS if failures >= AUTH_FAILURE_LIMIT else 0
+            failure_limit = AUTH_PASSWORD_FAILURE_LIMIT if purpose == "password" else AUTH_FAILURE_LIMIT
+            cooldown_until = current + AUTH_LOCKOUT_SECONDS if failures >= failure_limit else 0
             if cooldown_until:
                 failures = 0
                 window_started = current
@@ -402,7 +436,208 @@ class Store:
             )
         return max(0, cooldown_until - current)
 
-    def clear_auth_attempts(self, owner_id: int, purpose: str | None = None) -> None:
+    def _phone_scope_key(self, account_phone: str) -> str:
+        value = account_phone.strip()
+        if not value:
+            raise ValueError("Authentication scope must not be empty")
+        message = b"tgvault-auth-scope-v1:" + value.encode("utf-8")
+        return hmac.new(self._scope_key, message, hashlib.sha256).hexdigest()
+
+    def _begin_scoped_auth_attempt(self, owner_id: int, purpose: str, account_phone: str, current: int) -> int:
+        phone_key = self._phone_scope_key(account_phone)
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            legacy = conn.execute(
+                "SELECT window_started_at, cooldown_until, next_attempt_at FROM auth_attempts "
+                "WHERE owner_id = ? AND purpose = ?",
+                (owner_id, purpose),
+            ).fetchone()
+            if legacy and legacy["cooldown_until"] > current:
+                return max(1, int(legacy["cooldown_until"] - current))
+            if (
+                legacy
+                and current - int(legacy["window_started_at"]) < AUTH_FAILURE_WINDOW_SECONDS
+                and legacy["next_attempt_at"] > current
+            ):
+                return max(1, int(legacy["next_attempt_at"] - current))
+            row = conn.execute(
+                "SELECT failures, window_started_at, cooldown_until, next_attempt_at "
+                "FROM auth_attempts_scoped WHERE owner_id = ? AND purpose = ? AND phone_key = ?",
+                (owner_id, purpose, phone_key),
+            ).fetchone()
+            if row and row["cooldown_until"] > current:
+                return max(1, int(row["cooldown_until"] - current))
+            expired = not row or current - row["window_started_at"] >= AUTH_FAILURE_WINDOW_SECONDS
+            if row and row["next_attempt_at"] > current and not expired:
+                return max(1, int(row["next_attempt_at"] - current))
+            failures = 0 if expired else int(row["failures"])
+            window_started = current if expired else int(row["window_started_at"])
+            conn.execute(
+                "INSERT INTO auth_attempts_scoped(owner_id, purpose, phone_key, failures, window_started_at, cooldown_until, next_attempt_at) "
+                "VALUES(?,?,?,?,?,0,?) ON CONFLICT(owner_id, purpose, phone_key) DO UPDATE SET "
+                "failures = excluded.failures, window_started_at = excluded.window_started_at, "
+                "cooldown_until = 0, next_attempt_at = excluded.next_attempt_at",
+                (owner_id, purpose, phone_key, failures, window_started, current + AUTH_MIN_INTERVAL_SECONDS),
+            )
+            conn.execute(
+                "DELETE FROM auth_attempts_scoped WHERE window_started_at < ? AND cooldown_until < ?",
+                (current - 24 * 60 * 60, current),
+            )
+        return 0
+
+    def _record_scoped_auth_failure(self, owner_id: int, purpose: str, account_phone: str, current: int) -> int:
+        phone_key = self._phone_scope_key(account_phone)
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT failures, window_started_at, next_attempt_at FROM auth_attempts_scoped "
+                "WHERE owner_id = ? AND purpose = ? AND phone_key = ?",
+                (owner_id, purpose, phone_key),
+            ).fetchone()
+            expired = not row or current - row["window_started_at"] >= AUTH_FAILURE_WINDOW_SECONDS
+            failures = (0 if expired else int(row["failures"])) + 1
+            window_started = current if expired else int(row["window_started_at"])
+            failure_limit = AUTH_PASSWORD_FAILURE_LIMIT if purpose == "password" else AUTH_FAILURE_LIMIT
+            cooldown_until = current + AUTH_LOCKOUT_SECONDS if failures >= failure_limit else 0
+            if cooldown_until:
+                failures = 0
+                window_started = current
+            conn.execute(
+                "INSERT INTO auth_attempts_scoped(owner_id, purpose, phone_key, failures, window_started_at, cooldown_until, next_attempt_at) "
+                "VALUES(?,?,?,?,?,?,?) ON CONFLICT(owner_id, purpose, phone_key) DO UPDATE SET "
+                "failures = excluded.failures, window_started_at = excluded.window_started_at, "
+                "cooldown_until = excluded.cooldown_until, next_attempt_at = excluded.next_attempt_at",
+                (
+                    owner_id,
+                    purpose,
+                    phone_key,
+                    failures,
+                    window_started,
+                    cooldown_until,
+                    max(current + AUTH_MIN_INTERVAL_SECONDS, int(row["next_attempt_at"]) if row else 0),
+                ),
+            )
+        return max(0, cooldown_until - current)
+
+    def defer_auth_attempt(
+        self,
+        owner_id: int,
+        purpose: str,
+        seconds: int,
+        account_phone: str | None = None,
+        now: int | None = None,
+    ) -> None:
+        """Persist Telegram's server-mandated FloodWait for one auth scope."""
+        if purpose not in {"code", "password"}:
+            raise ValueError("Unsupported authentication purpose")
+        current = int(time.time()) if now is None else int(now)
+        until = current + max(1, int(seconds))
+        scoped_table = "auth_attempts_scoped" if account_phone is not None else "auth_attempts"
+        scope_values: tuple[Any, ...] = (owner_id, purpose, self._phone_scope_key(account_phone)) if account_phone is not None else (owner_id, purpose)
+        where = "owner_id = ? AND purpose = ? AND phone_key = ?" if account_phone is not None else "owner_id = ? AND purpose = ?"
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                f"SELECT failures, window_started_at, cooldown_until, next_attempt_at FROM {scoped_table} WHERE {where}",
+                scope_values,
+            ).fetchone()
+            expired = not row or current - int(row["window_started_at"]) >= AUTH_FAILURE_WINDOW_SECONDS
+            failures = 0 if expired else int(row["failures"])
+            window_started = current if expired else int(row["window_started_at"])
+            cooldown_until = max(until, int(row["cooldown_until"]) if row else 0)
+            next_attempt_at = max(cooldown_until, int(row["next_attempt_at"]) if row else 0)
+            if account_phone is not None:
+                conn.execute(
+                    "INSERT INTO auth_attempts_scoped(owner_id, purpose, phone_key, failures, window_started_at, cooldown_until, next_attempt_at) "
+                    "VALUES(?,?,?,?,?,?,?) ON CONFLICT(owner_id, purpose, phone_key) DO UPDATE SET "
+                    "failures=excluded.failures, window_started_at=excluded.window_started_at, "
+                    "cooldown_until=excluded.cooldown_until, next_attempt_at=excluded.next_attempt_at",
+                    (*scope_values, failures, window_started, cooldown_until, next_attempt_at),
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO auth_attempts(owner_id, purpose, failures, window_started_at, cooldown_until, next_attempt_at) "
+                    "VALUES(?,?,?,?,?,?) ON CONFLICT(owner_id, purpose) DO UPDATE SET "
+                    "failures=excluded.failures, window_started_at=excluded.window_started_at, "
+                    "cooldown_until=excluded.cooldown_until, next_attempt_at=excluded.next_attempt_at",
+                    (*scope_values, failures, window_started, cooldown_until, next_attempt_at),
+                )
+
+    def reserve_phone_code_request(self, owner_id: int, phone: str, now: int | None = None) -> tuple[int, int]:
+        """Reserve one initial/resend request, enforcing a per-owner, per-number window."""
+        current = int(time.time()) if now is None else int(now)
+        phone_key = self._phone_scope_key(phone)
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT attempts, window_started_at, next_attempt_at FROM phone_code_limits "
+                "WHERE owner_id = ? AND phone_key = ?",
+                (owner_id, phone_key),
+            ).fetchone()
+            expired = not row or current - int(row["window_started_at"]) >= PHONE_CODE_REQUEST_WINDOW_SECONDS
+            attempts = 0 if expired else int(row["attempts"])
+            window_started = current if expired else int(row["window_started_at"])
+            next_attempt_at = int(row["next_attempt_at"]) if row else 0
+            wait_seconds = max(0, next_attempt_at - current)
+            if attempts >= PHONE_CODE_REQUEST_LIMIT:
+                wait_seconds = max(wait_seconds, window_started + PHONE_CODE_REQUEST_WINDOW_SECONDS - current)
+            if wait_seconds > 0:
+                return max(1, int(wait_seconds)), attempts
+            attempts += 1
+            conn.execute(
+                "INSERT INTO phone_code_limits(owner_id, phone_key, attempts, window_started_at, next_attempt_at) "
+                "VALUES(?,?,?,?,?) ON CONFLICT(owner_id, phone_key) DO UPDATE SET "
+                "attempts=excluded.attempts, window_started_at=excluded.window_started_at, "
+                "next_attempt_at=excluded.next_attempt_at",
+                (owner_id, phone_key, attempts, window_started, current + PHONE_CODE_MIN_INTERVAL_SECONDS),
+            )
+            conn.execute(
+                "DELETE FROM phone_code_limits WHERE window_started_at < ? AND next_attempt_at < ?",
+                (current - 24 * 60 * 60, current),
+            )
+        return 0, attempts
+
+    def defer_phone_code_request(self, owner_id: int, phone: str, seconds: int, now: int | None = None) -> None:
+        """Persist Telegram's FloodWait without storing the phone number itself."""
+        current = int(time.time()) if now is None else int(now)
+        phone_key = self._phone_scope_key(phone)
+        until = current + max(1, int(seconds))
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT attempts, window_started_at, next_attempt_at FROM phone_code_limits "
+                "WHERE owner_id = ? AND phone_key = ?",
+                (owner_id, phone_key),
+            ).fetchone()
+            expired = not row or current - int(row["window_started_at"]) >= PHONE_CODE_REQUEST_WINDOW_SECONDS
+            attempts = 0 if expired else int(row["attempts"])
+            window_started = current if expired else int(row["window_started_at"])
+            next_attempt_at = max(until, int(row["next_attempt_at"]) if row else 0)
+            conn.execute(
+                "INSERT INTO phone_code_limits(owner_id, phone_key, attempts, window_started_at, next_attempt_at) "
+                "VALUES(?,?,?,?,?) ON CONFLICT(owner_id, phone_key) DO UPDATE SET "
+                "attempts=excluded.attempts, window_started_at=excluded.window_started_at, "
+                "next_attempt_at=excluded.next_attempt_at",
+                (owner_id, phone_key, attempts, window_started, next_attempt_at),
+            )
+
+    def clear_auth_attempts(
+        self, owner_id: int, purpose: str | None = None, account_phone: str | None = None
+    ) -> None:
+        if account_phone is not None:
+            phone_key = self._phone_scope_key(account_phone)
+            with self._connect() as conn:
+                if purpose is None:
+                    conn.execute(
+                        "DELETE FROM auth_attempts_scoped WHERE owner_id = ? AND phone_key = ?",
+                        (owner_id, phone_key),
+                    )
+                else:
+                    conn.execute(
+                        "DELETE FROM auth_attempts_scoped WHERE owner_id = ? AND purpose = ? AND phone_key = ?",
+                        (owner_id, purpose, phone_key),
+                    )
+            return
         with self._connect() as conn:
             if purpose is None:
                 conn.execute("DELETE FROM auth_attempts WHERE owner_id = ?", (owner_id,))
