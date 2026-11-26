@@ -36,6 +36,19 @@ SCENE_LABELS = {
     "offline": "其他离线",
 }
 
+SCENE_LABELS_EN = {
+    "welcome": "First contact/welcome",
+    "night": "Nighttime",
+    "busy": "Busy",
+    "sales": "Sales/after-sales",
+    "offline": "Other offline",
+}
+
+
+def scene_labels(language: str = "zh") -> dict[str, str]:
+    """Return fixed UI labels for the selected language, never reply templates."""
+    return SCENE_LABELS_EN if language == "en" else SCENE_LABELS
+
 _ALLOWED_SCENES = set(DEFAULT_SCENES)
 _PLACEHOLDER = re.compile(r"\{([a-z_]+)\}")
 

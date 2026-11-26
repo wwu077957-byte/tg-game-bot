@@ -86,28 +86,34 @@ def search_countries(query: str) -> list[Country]:
 
 
 class PhoneInputError(ValueError):
-    pass
+    def __init__(self, chinese: str, english: str | None = None) -> None:
+        super().__init__(chinese)
+        self.chinese = chinese
+        self.english = english or chinese
+
+    def localized(self, language: str) -> str:
+        return self.english if language == "en" else self.chinese
 
 
 def normalize_phone_for_country(value: str, region: str) -> str:
     """Return an E.164 number and reject numbers that conflict with the chosen region."""
     country = get_country(region)
     if not country:
-        raise PhoneInputError("不支持所选国家/地区，请重新选择。")
+        raise PhoneInputError("不支持所选国家/地区，请重新选择。", "The selected country/region is not supported. Please choose another.")
     raw = value.strip()
     if not raw or not re.fullmatch(r"\+?[0-9\s().-]+", raw):
-        raise PhoneInputError("号码中只能包含数字、空格、括号、点、横线，或开头的 +。")
+        raise PhoneInputError("号码中只能包含数字、空格、括号、点、横线，或开头的 +。", "Use only digits, spaces, parentheses, periods, hyphens, and an optional + at the beginning.")
     compact = re.sub(r"[\s().-]", "", raw)
     try:
         number = phonenumbers.parse(compact, region)
     except phonenumbers.NumberParseException as exc:
-        raise PhoneInputError("无法按所选国家/地区解析这个号码。请核对号码或重新选择国家。") from exc
+        raise PhoneInputError("无法按所选国家/地区解析这个号码。请核对号码或重新选择国家。", "This number could not be parsed for the selected country/region. Check it or choose another country.") from exc
     if number.extension:
-        raise PhoneInputError("请发送手机号本身，不要包含分机号。")
+        raise PhoneInputError("请发送手机号本身，不要包含分机号。", "Send the phone number without an extension.")
     if not phonenumbers.is_possible_number(number):
-        raise PhoneInputError("号码长度或结构不符合所选国家/地区。请核对号码，或重新选择国家。")
+        raise PhoneInputError("号码长度或结构不符合所选国家/地区。请核对号码，或重新选择国家。", "The number's length or structure does not match the selected country/region. Check it or choose another country.")
     if not phonenumbers.is_valid_number(number):
-        raise PhoneInputError("号码虽可解析，但不在所选国家/地区已识别的有效号码范围内。请核对号码。")
+        raise PhoneInputError("号码虽可解析，但不在所选国家/地区已识别的有效号码范围内。请核对号码。", "The number can be parsed, but it is not within a recognized valid range for the selected country/region. Check the number.")
 
     actual_region = phonenumbers.region_code_for_number(number)
     if actual_region and actual_region != "001" and actual_region != country.region:
@@ -115,6 +121,8 @@ def normalize_phone_for_country(value: str, region: str) -> str:
         if actual_country:
             raise PhoneInputError(
                 f"号码区号/号段更像是{actual_country.name}（{actual_country.calling_code}），"
-                f"而不是所选的{country.name}（{country.calling_code}）。请核对号码或重新选择国家。"
+                f"而不是所选的{country.name}（{country.calling_code}）。请核对号码或重新选择国家。",
+                f"The number's area/code range looks more like {actual_country.english_name} ({actual_country.calling_code}) "
+                f"than the selected {country.english_name} ({country.calling_code}). Check the number or choose another country.",
             )
     return phonenumbers.format_number(number, PhoneNumberFormat.E164)

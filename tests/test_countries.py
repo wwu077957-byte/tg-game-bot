@@ -30,6 +30,12 @@ class CountryPickerTests(unittest.TestCase):
         with self.assertRaisesRegex(PhoneInputError, "美国"):
             normalize_phone_for_country("415-555-2671", "CA")
 
+    def test_phone_validation_errors_can_be_localized(self) -> None:
+        with self.assertRaises(PhoneInputError) as raised:
+            normalize_phone_for_country("416-555-0123", "US")
+        self.assertIn("Canada", raised.exception.localized("en"))
+        self.assertIn("加拿大", raised.exception.localized("zh"))
+
     def test_catalog_includes_all_phone_regions_and_rejects_unassigned_numbers(self) -> None:
         regions = {country.region for country in search_countries("+1")}
         self.assertIn("CA", regions)

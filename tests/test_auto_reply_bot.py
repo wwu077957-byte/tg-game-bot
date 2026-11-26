@@ -41,6 +41,20 @@ class FakeClient:
         return SimpleNamespace(id=900)
 
 
+class FakeAccountReader:
+    def __init__(self, *_args: object, **_kwargs: object) -> None:
+        pass
+
+    async def connect(self) -> None:
+        return None
+
+    async def disconnect(self) -> None:
+        return None
+
+    async def __call__(self, _request: object):
+        return SimpleNamespace(authorizations=[], has_password=True)
+
+
 class FakeGateMessage:
     def __init__(self) -> None:
         self.replies: list[tuple[str, dict[str, object]]] = []
@@ -89,6 +103,68 @@ class AutoReplyBotTests(unittest.IsolatedAsyncioTestCase):
         bot.auto_sending_peers.clear()
         bot.pending_human_challenges.clear()
         self.tmp.cleanup()
+
+    def test_account_labels_and_country_picker_follow_language(self) -> None:
+        row = self.store.get_account(101, self.account_id)
+        row.update({"label": "Work", "group_name": "Friends"})
+        self.assertIn("Group: Friends", bot.format_account(row, "en"))
+        self.assertIn("分组：Friends", bot.format_account(row, "zh"))
+
+        english_buttons = [button.text for row in bot.country_start_keyboard("en").inline_keyboard for button in row]
+        chinese_buttons = [button.text for row in bot.country_start_keyboard("zh").inline_keyboard for button in row]
+        self.assertIn("United States +1", english_buttons)
+        self.assertIn("美国 +1", chinese_buttons)
+        english_countries = [button.text for row in bot.country_results_keyboard(["US", "CA"], 0, "en").inline_keyboard for button in row]
+        self.assertIn("United States +1", english_countries)
+
+    def test_delivery_instructions_and_next_channel_are_bilingual(self) -> None:
+        app_type = bot.types.auth.SentCodeTypeApp(length=5)
+        next_type = bot.types.auth.CodeTypeCall()
+        english = bot.code_delivery_message(
+            "+15551234567", app_type, next_type, 60,
+            has_matching_account=True, language="en",
+        )
+        chinese = bot.code_delivery_message(
+            "+15551234567", app_type, next_type, 60,
+            has_matching_account=True, language="zh",
+        )
+        self.assertIn("official service message", english)
+        self.assertIn("Next method offered by Telegram: Voice call", english)
+        self.assertIn("select the button below", english)
+        self.assertIn("Telegram 提供的下一种通道是：语音电话", chinese)
+        self.assertIn("明确点选下方按钮", chinese)
+        self.assertIn("/resend", english)
+        self.assertIn("/resend", chinese)
+
+    def test_auto_reply_scene_labels_use_language_without_changing_templates(self) -> None:
+        english = [button.text for row in bot.auto_scene_keyboard(1, "en").inline_keyboard for button in row]
+        chinese = [button.text for row in bot.auto_scene_keyboard(1, "zh").inline_keyboard for button in row]
+        self.assertIn("First contact/welcome", english)
+        self.assertIn("首次接触/欢迎语", chinese)
+        self.assertEqual(bot.scene_labels("en")["welcome"], "First contact/welcome")
+        self.assertIn("你好", bot.store.get_auto_reply_settings(101, self.account_id)["scenes"]["welcome"])
+
+    async def test_device_and_twofa_success_screens_use_user_id_and_english(self) -> None:
+        self.store.set_language(101, "en")
+        message = FakeGateMessage()
+        with patch.object(bot, "TelegramClient", FakeAccountReader), patch.object(bot, "StringSession", lambda _session: "session"):
+            await bot.show_devices(101, self.account_id, message)
+            await bot.show_twofa(101, self.account_id, message)
+        self.assertIn("Telegram login devices", message.replies[0][0])
+        self.assertIn("Two-step verification for this account: Enabled", message.replies[1][0])
+        self.assertIsNotNone(message.replies[0][1]["reply_markup"])
+        self.assertIsNotNone(message.replies[1][1]["reply_markup"])
+
+    async def test_rename_flow_success_uses_saved_language(self) -> None:
+        self.store.set_language(101, "en")
+        self.store.mark_human_verified(101)
+        bot.flows[101] = bot.Flow(state="rename")
+        message = FakeGateMessage()
+        message.text = f"{self.account_id} Work"
+        update = SimpleNamespace(effective_user=SimpleNamespace(id=101), effective_chat=SimpleNamespace(type="private"), effective_message=message)
+        await bot.handle_text(update, SimpleNamespace(bot=FakeGateBot()))
+        self.assertEqual(message.replies[0][0], "Label updated.")
+        self.assertEqual(self.store.get_account(101, self.account_id)["label"], "Work")
 
     async def test_no_auto_reply_is_sent_without_explicit_enablement(self) -> None:
         client = FakeClient()
