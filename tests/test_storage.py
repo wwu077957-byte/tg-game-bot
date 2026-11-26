@@ -81,6 +81,22 @@ class StoreTests(unittest.TestCase):
         self.assertGreaterEqual(len(self.store.list_audit(101)), 3)
         self.assertEqual(self.store.list_audit(202), [])
 
+    def test_language_preference_defaults_to_chinese_and_persists_per_user(self) -> None:
+        self.assertEqual(self.store.get_language(101), "zh")
+        self.store.set_language(101, "en")
+        reopened = Store(str(self.db), self.key)
+        self.assertEqual(reopened.get_language(101), "en")
+        self.assertEqual(reopened.get_language(202), "zh")
+        with self.assertRaises(ValueError):
+            self.store.set_language(101, "fr")
+
+    def test_human_verification_is_required_once_and_persists_per_user(self) -> None:
+        self.assertFalse(self.store.is_human_verified(101))
+        self.store.mark_human_verified(101, now=1234)
+        reopened = Store(str(self.db), self.key)
+        self.assertTrue(reopened.is_human_verified(101))
+        self.assertFalse(reopened.is_human_verified(202))
+
     def test_code_and_password_failures_have_separate_persistent_cooldowns(self) -> None:
         now = 10_000
         for attempt in range(5):

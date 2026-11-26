@@ -73,6 +73,11 @@ class AutoReplyLogicTests(unittest.TestCase):
         self.assertNotIn("manual_auto", config)
         self.assertNotIn("pending_count", config)
 
+    def test_simple_reply_is_available_and_limited_to_one_thousand_characters(self) -> None:
+        self.assertEqual(normalize_config(default_config())["simple_reply"], "")
+        self.assertEqual(normalize_config({"simple_reply": "hello"})["simple_reply"], "hello")
+        self.assertEqual(len(normalize_config({"simple_reply": "x" * 1100})["simple_reply"]), 1000)
+
 
 class AutoReplyStoreTests(unittest.TestCase):
     def setUp(self) -> None:

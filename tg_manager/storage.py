@@ -104,6 +104,14 @@ class Store:
                     owner_id INTEGER PRIMARY KEY,
                     security_alerts INTEGER NOT NULL DEFAULT 1
                 );
+                CREATE TABLE IF NOT EXISTS user_preferences (
+                    owner_id INTEGER PRIMARY KEY,
+                    language TEXT NOT NULL DEFAULT 'zh' CHECK(language IN ('zh', 'en'))
+                );
+                CREATE TABLE IF NOT EXISTS bot_verifications (
+                    owner_id INTEGER PRIMARY KEY,
+                    verified_at INTEGER NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS audit (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     owner_id INTEGER NOT NULL,
@@ -681,6 +689,34 @@ class Store:
         with self._connect() as conn:
             row = conn.execute("SELECT security_alerts FROM settings WHERE owner_id = ?", (owner_id,)).fetchone()
         return bool(row[0]) if row else True
+
+    def get_language(self, owner_id: int) -> str:
+        with self._connect() as conn:
+            row = conn.execute("SELECT language FROM user_preferences WHERE owner_id = ?", (owner_id,)).fetchone()
+        return str(row[0]) if row and row[0] in {"zh", "en"} else "zh"
+
+    def set_language(self, owner_id: int, language: str) -> None:
+        if language not in {"zh", "en"}:
+            raise ValueError("Unsupported language")
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT INTO user_preferences(owner_id, language) VALUES(?,?) "
+                "ON CONFLICT(owner_id) DO UPDATE SET language = excluded.language",
+                (owner_id, language),
+            )
+
+    def is_human_verified(self, owner_id: int) -> bool:
+        with self._connect() as conn:
+            row = conn.execute("SELECT 1 FROM bot_verifications WHERE owner_id = ?", (owner_id,)).fetchone()
+        return row is not None
+
+    def mark_human_verified(self, owner_id: int, *, now: int | None = None) -> None:
+        current = int(time.time()) if now is None else int(now)
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO bot_verifications(owner_id, verified_at) VALUES(?,?)",
+                (owner_id, current),
+            )
 
     def audit(self, owner_id: int, action: str, account_id: int | None = None, detail: str = "") -> None:
         now = int(time.time())

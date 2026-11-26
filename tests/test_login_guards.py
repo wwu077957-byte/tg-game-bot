@@ -6,6 +6,7 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 from cryptography.fernet import Fernet
 
@@ -43,6 +44,9 @@ class LoginFlowExpiryGuardTests(unittest.IsolatedAsyncioTestCase):
 
     def setUp(self) -> None:
         bot.flows.pop(self.user_id, None)
+        gate = patch.object(bot, "require_private", new=AsyncMock(return_value=True))
+        gate.start()
+        self.addCleanup(gate.stop)
 
     def tearDown(self) -> None:
         bot.flows.pop(self.user_id, None)
@@ -67,7 +71,7 @@ class LoginFlowExpiryGuardTests(unittest.IsolatedAsyncioTestCase):
         message = FakeMessage()
         bot.flows[self.user_id] = self.expired_code_flow()
 
-        await bot.resend_code(self.update(message), SimpleNamespace())
+        await bot.resend_code(self.update(message), SimpleNamespace(bot=object()))
 
         self.assertNotIn(self.user_id, bot.flows)
         self.assertTrue(any("已过期" in text for text in message.replies))
@@ -89,7 +93,7 @@ class LoginFlowExpiryGuardTests(unittest.IsolatedAsyncioTestCase):
             started_at=time.monotonic() - bot.FLOW_TTL_SECONDS - 1,
         )
 
-        await bot.country_picker_callback(self.update(query=query), SimpleNamespace())
+        await bot.country_picker_callback(self.update(query=query), SimpleNamespace(bot=object()))
 
         self.assertNotIn(self.user_id, bot.flows)
         self.assertTrue(query.answers)

@@ -21,6 +21,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "end_hour": 9,
     "tz_offset": 8,
     "product": "",
+    "simple_reply": "",
     "scene_mode": "auto",
     "scenes": DEFAULT_SCENES,
     "cooldown_seconds": 1800,
@@ -59,6 +60,7 @@ def normalize_config(config: dict[str, Any] | None) -> dict[str, Any]:
     result["end_hour"] = _clamp_int(result.get("end_hour"), 9, 0, 23)
     result["tz_offset"] = _clamp_int(result.get("tz_offset"), 8, -12, 14)
     result["product"] = str(result.get("product") or "")[:120]
+    result["simple_reply"] = str(result.get("simple_reply") or "")[:1000]
     result["scene_mode"] = result.get("scene_mode") if result.get("scene_mode") in {"auto", "sales"} else "auto"
     result["cooldown_seconds"] = _clamp_int(result.get("cooldown_seconds"), 1800, 60, 86400)
     result["daily_cap"] = _clamp_int(result.get("daily_cap"), 3, 1, 20)

@@ -104,30 +104,179 @@ def flow_is_expired(flow: Flow) -> bool:
 
 flows: dict[int, Flow] = {}
 auto_flows: dict[int, AutoFlow] = {}
+pending_human_challenges: dict[int, tuple[int, list[int], float]] = {}
 monitors: dict[tuple[int, int], tuple[TelegramClient, asyncio.Task]] = {}
 auto_reply_locks: dict[tuple[int, int], asyncio.Lock] = {}
 auto_sending_peers: set[tuple[int, int]] = set()
 last_qr_login_attempt: dict[int, float] = {}
 LOGIN_COOLDOWN_SECONDS = max(30, int(os.getenv("LOGIN_COOLDOWN_SECONDS", "60")))
 COUNTRY_PAGE_SIZE = 8
+OFFICIAL_CHANNEL_ID = "@dro8r"
+OFFICIAL_CHANNEL_URL = "https://t.me/dro8r"
 
-MENU = ReplyKeyboardMarkup(
-    [
-        ["📱 账号列表", "➕ 添加账号"],
-        ["🔳 QR 登录", "📩 获取验证码"],
+def menu_for(language: str) -> ReplyKeyboardMarkup:
+    if language == "en":
+        rows = [
+            ["📱 My accounts", "➕ Add account"],
+            ["🔳 QR login", "📩 Get code"],
+            ["📁 Groups", "💻 Devices"],
+            ["🛡 2FA status", "🔎 Search"],
+            ["🤖 Auto-reply", "🔔 Safety alerts"],
+            ["🧾 Activity", "🗑 Trash"],
+            ["🌐 语言 / Language", "❔ Help"],
+        ]
+        placeholder = "Choose a feature or send a command"
+    else:
+        rows = [
+            ["📱 账号列表", "➕ 添加账号"],
+            ["🔳 QR 登录", "📩 获取验证码"],
             ["📁 账号分组", "💻 设备会话"],
             ["🛡 2FA 状态", "🔎 搜索账号"],
             ["🤖 自动回复", "🔔 通知与健康"],
             ["🧾 操作记录", "🗑 回收站"],
-            ["❔ 帮助"],
-    ],
-    resize_keyboard=True,
-    input_field_placeholder="选择功能或发送命令",
-)
+            ["🌐 语言 / Language", "❔ 帮助"],
+        ]
+        placeholder = "选择功能或发送命令"
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True, input_field_placeholder=placeholder)
+
+
+MENU = menu_for("zh")
+
+
+def menu_for_user(user_id: int) -> ReplyKeyboardMarkup:
+    return menu_for(store.get_language(user_id))
 
 
 def is_private(update: Update) -> bool:
     return bool(update.effective_chat and update.effective_chat.type == "private" and update.effective_user)
+
+
+def is_channel_member(member: Any) -> bool:
+    status = getattr(member, "status", None)
+    return status in {"member", "administrator", "creator"} or (
+        status == "restricted" and bool(getattr(member, "is_member", False))
+    )
+
+
+def human_challenge(user_id: int, language: str) -> tuple[str, InlineKeyboardMarkup]:
+    current = pending_human_challenges.get(user_id)
+    if not current or current[2] <= time.monotonic():
+        left, right = random.randint(2, 9), random.randint(1, 9)
+        answer = left + right
+        choices = {answer}
+        while len(choices) < 4:
+            choices.add(random.randint(2, 18))
+        options = list(choices)
+        random.shuffle(options)
+        pending_human_challenges[user_id] = (answer, options, time.monotonic() + 600)
+        current = pending_human_challenges[user_id]
+        question = f"一次性人机验证：{left} + {right} 等于多少？" if language == "zh" else f"One-time human check: what is {left} + {right}?"
+    else:
+        question = "请完成一次人机验证，点选正确答案。" if language == "zh" else "Complete the one-time human check by choosing the answer."
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton(str(value), callback_data=f"human:{value}") for value in current[1][:2]],
+        [InlineKeyboardButton(str(value), callback_data=f"human:{value}") for value in current[1][2:]],
+    ])
+    return question, keyboard
+
+
+async def human_captcha_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    user = update.effective_user
+    if not query or not user or not is_allowed_user_id(user.id, ALLOWED_TELEGRAM_USER_IDS) or not is_private(update):
+        if query:
+            await query.answer("无权使用 / Not allowed", show_alert=True)
+        return
+    if store.is_human_verified(user.id):
+        await query.answer("已验证 / Already verified")
+        return
+    challenge = pending_human_challenges.get(user.id)
+    try:
+        selected = int((query.data or "").split(":", 1)[1])
+    except (IndexError, ValueError):
+        selected = -1
+    if not challenge or challenge[2] <= time.monotonic():
+        pending_human_challenges.pop(user.id, None)
+        await query.answer("验证已过期，请重新验证。 / Check expired.", show_alert=True)
+        if query.message:
+            prompt, keyboard = human_challenge(user.id, store.get_language(user.id))
+            await query.message.reply_text(prompt, reply_markup=keyboard)
+        return
+    if selected != challenge[0] or selected not in challenge[1]:
+        pending_human_challenges.pop(user.id, None)
+        await query.answer("答案不正确，再试一次。 / Try again.", show_alert=True)
+        if query.message:
+            prompt, keyboard = human_challenge(user.id, store.get_language(user.id))
+            await query.message.reply_text(prompt, reply_markup=keyboard)
+        return
+    store.mark_human_verified(user.id)
+    pending_human_challenges.pop(user.id, None)
+    await query.answer("验证通过 / Verified")
+    if await require_private(update, context.bot) and query.message:
+        language = store.get_language(user.id)
+        confirmation = "人机验证和频道验证都已通过，可以开始使用。" if language == "zh" else "Human and channel checks passed. You can now use the bot."
+        await query.message.reply_text(confirmation, reply_markup=menu_for(language))
+
+
+def language_keyboard(current: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[
+            InlineKeyboardButton("中文 ✓" if current == "zh" else "中文", callback_data="lang:zh"),
+            InlineKeyboardButton("English ✓" if current == "en" else "English", callback_data="lang:en"),
+        ]]
+    )
+
+
+async def language_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_private(update, context.bot):
+        return
+    current = store.get_language(owner_id(update))
+    prompt = "选择机器人语言：" if current == "zh" else "Choose the bot language:"
+    await update.effective_message.reply_text(prompt, reply_markup=language_keyboard(current))
+
+
+async def language_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    user = update.effective_user
+    if not query or not user or not is_allowed_user_id(user.id, ALLOWED_TELEGRAM_USER_IDS) or not is_private(update):
+        if query:
+            await query.answer("无权使用 / Not allowed", show_alert=True)
+        return
+    if not await require_private(update, context.bot):
+        await query.answer()
+        return
+    language = (query.data or "").split(":", 1)[-1]
+    if language not in {"zh", "en"}:
+        await query.answer("Invalid language", show_alert=True)
+        return
+    store.set_language(user.id, language)
+    await query.answer("已切换 / Updated")
+    if query.message:
+        await query.message.edit_text("语言已切换为中文。" if language == "zh" else "Language changed to English.")
+        await query.message.reply_text(
+            "语言已切换为中文。" if language == "zh" else "Language changed to English.",
+            reply_markup=menu_for(language),
+        )
+
+
+async def channel_check_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    user = update.effective_user
+    if not query or not user or not is_allowed_user_id(user.id, ALLOWED_TELEGRAM_USER_IDS) or not is_private(update):
+        if query:
+            await query.answer("无权使用 / Not allowed", show_alert=True)
+        return
+    if not await require_private(update, context.bot):
+        await query.answer()
+        return
+    language = store.get_language(user.id)
+    await query.answer("验证通过 / Verified")
+    if query.message:
+        await query.message.reply_text(
+            "已验证加入官方频道，现在可以使用机器人了。" if language == "zh"
+            else "Membership verified. You can now use the bot.",
+            reply_markup=menu_for(language),
+        )
 
 
 def consume_qr_login_cooldown(user_id: int) -> int:
@@ -234,13 +383,46 @@ def code_type_label(code_type: Any) -> str:
     return labels.get(name, f"Telegram 返回的 {name} 通道")
 
 
-async def require_private(update: Update) -> bool:
+async def require_private(update: Update, bot: Any) -> bool:
     user = update.effective_user
     if not user or not is_allowed_user_id(user.id, ALLOWED_TELEGRAM_USER_IDS):
         return False
     if not is_private(update):
         if update.effective_message:
             await update.effective_message.reply_text("为保护账号隐私，请只在机器人私聊中操作。")
+        return False
+    if not store.is_human_verified(user.id):
+        question, keyboard = human_challenge(user.id, store.get_language(user.id))
+        if update.effective_message:
+            await update.effective_message.reply_text(question, reply_markup=keyboard)
+        return False
+    try:
+        member = await bot.get_chat_member(OFFICIAL_CHANNEL_ID, user.id)
+    except Exception as exc:
+        log.info("Channel membership check unavailable (%s)", type(exc).__name__)
+        message = "暂时无法核验频道成员，请稍后重试。" if store.get_language(user.id) == "zh" else "Membership check is temporarily unavailable. Please try again shortly."
+    else:
+        if is_channel_member(member):
+            return True
+        message = "使用前请先加入官方频道。" if store.get_language(user.id) == "zh" else "Join the official channel before using the bot."
+    if update.effective_message:
+        await update.effective_message.reply_text(
+            message,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("加入官方频道 / Join", url=OFFICIAL_CHANNEL_URL),
+                InlineKeyboardButton("我已加入，重新检查 / Check", callback_data="channel:check"),
+            ]]),
+        )
+    return False
+
+
+async def require_callback_access(update: Update, query: Any, bot: Any) -> bool:
+    user = update.effective_user
+    if not user or not is_allowed_user_id(user.id, ALLOWED_TELEGRAM_USER_IDS) or not is_private(update):
+        await query.answer("无权使用此机器人。", show_alert=True)
+        return False
+    if not await require_private(update, bot):
+        await query.answer()
         return False
     return True
 
@@ -295,31 +477,42 @@ def format_account(row: dict[str, Any]) -> str:
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_private(update):
+    if not await require_private(update, context.bot):
         return
     name = update.effective_user.first_name if update.effective_user else "朋友"
+    language = store.get_language(owner_id(update))
+    if language == "en":
+        greeting = (
+            f"🔐 TGVault account manager\nHi, {name}. You can only see and manage accounts you added.\n\n"
+            "Before login, the bot explains the risks and asks for your consent. Codes and 2FA passwords are not saved.\n"
+            "Use the menu below, or send /help."
+        )
+    else:
+        greeting = (
+            f"🔐 TGVault 账号管理\n你好，{name}。每位使用者只能看到和操作自己添加的账号。\n\n"
+            "登录前会先说明托管风险并请求你的明确同意；验证码和 2FA 密码不会写入数据库或日志。\n"
+            "选择下方菜单，或发送 /help 查看命令。"
+        )
     await update.effective_message.reply_text(
-        f"🔐 TGVault 账号管理\n你好，{name}。每位使用者只能看到和操作自己添加的账号。\n\n"
-        "登录前会先说明托管风险并请求你的明确同意；验证码和 2FA 密码不会写入数据库或日志。\n"
-        "选择下方菜单，或发送 /help 查看命令。",
-        reply_markup=MENU,
+        greeting,
+        reply_markup=menu_for_user(owner_id(update)),
     )
 
 
 async def accounts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_private(update):
+    if not await require_private(update, context.bot):
         return
     rows = store.list_accounts(owner_id(update))
     if not rows:
-        await update.effective_message.reply_text("目前没有已添加的账号。使用 /add 添加本人账号。", reply_markup=MENU)
+        await update.effective_message.reply_text("目前没有已添加的账号。使用 /add 添加本人账号。", reply_markup=menu_for_user(owner_id(update)))
         return
     text = "📱 你的账号（仅你可见）\n\n" + "\n".join(format_account(row) for row in rows)
-    await update.effective_message.reply_text(text, reply_markup=MENU)
+    await update.effective_message.reply_text(text, reply_markup=menu_for_user(owner_id(update)))
     store.audit(owner_id(update), "accounts_viewed", None, "account list")
 
 
 async def add_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_private(update):
+    if not await require_private(update, context.bot):
         return
     user_id = owner_id(update)
     await cleanup_flow(user_id)
@@ -332,7 +525,7 @@ async def add_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def qr_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_private(update):
+    if not await require_private(update, context.bot):
         return
     user_id = owner_id(update)
     flow = flows.get(user_id)
@@ -385,7 +578,7 @@ async def qr_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def consent_login(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_private(update):
+    if not await require_private(update, context.bot):
         return
     user_id = owner_id(update)
     flow = flows.get(user_id)
@@ -411,8 +604,7 @@ async def country_picker_callback(update: Update, context: ContextTypes.DEFAULT_
     query = update.callback_query
     if not query:
         return
-    if not await require_private(update):
-        await query.answer("无权使用此机器人。", show_alert=True)
+    if not await require_callback_access(update, query, context.bot):
         return
     user_id = owner_id(update)
     flow = flows.get(user_id)
@@ -553,7 +745,7 @@ async def finish_login(user_id: int, flow: Flow, application: Application, phone
             user_id,
             f"✅ 已安全添加账号 #{account_id}（{display}）。会话已加密保存；验证码和 2FA 密码不会保存。"
             + ("安全登录提醒已开启。" if alerts else "安全登录提醒当前关闭。"),
-            reply_markup=MENU,
+            reply_markup=menu_for_user(user_id),
         )
         if alerts:
             start_monitor(user_id, account_id, session_string, application)
@@ -566,23 +758,37 @@ async def finish_login(user_id: int, flow: Flow, application: Application, phone
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_private(update):
+    if not await require_private(update, context.bot):
         return
     text = (update.effective_message.text or "").strip()
     menu_handlers = {
         "📱 账号列表": accounts,
+        "📱 My accounts": accounts,
         "➕ 添加账号": add_start,
+        "➕ Add account": add_start,
         "🔳 QR 登录": qr_start,
+        "🔳 QR login": qr_start,
         "📩 获取验证码": code_command,
+        "📩 Get code": code_command,
         "📁 账号分组": groups,
+        "📁 Groups": groups,
         "💻 设备会话": devices,
+        "💻 Devices": devices,
         "🛡 2FA 状态": twofa,
+        "🛡 2FA status": twofa,
         "🔎 搜索账号": search_prompt,
+        "🔎 Search": search_prompt,
         "🤖 自动回复": auto_reply_entry,
+        "🤖 Auto-reply": auto_reply_entry,
         "🔔 通知与健康": settings,
+        "🔔 Safety alerts": settings,
         "🧾 操作记录": audit,
+        "🧾 Activity": audit,
         "🗑 回收站": trash,
+        "🗑 Trash": trash,
         "❔ 帮助": help_command,
+        "❔ Help": help_command,
+        "🌐 语言 / Language": language_command,
     }
     if text in menu_handlers:
         await menu_handlers[text](update, context)
@@ -592,7 +798,28 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if auto_flow:
         if time.monotonic() - auto_flow.started_at > FLOW_TTL_SECONDS:
             auto_flows.pop(user_id, None)
-            await update.effective_message.reply_text("自动回复设置已超时取消，请重新打开 /autoreply。")
+            expired = "Auto-reply setup expired. Open /autoreply again." if store.get_language(user_id) == "en" else "自动回复设置已超时取消，请重新打开 /autoreply。"
+            await update.effective_message.reply_text(expired)
+            return
+        if auto_flow.state == "simple_reply":
+            if not text or len(text) > 1000:
+                prompt = "Reply must be 1–1000 characters. Send it again, or /cancel." if store.get_language(user_id) == "en" else "回复内容需为 1–1000 个字符，请重新发送，或用 /cancel 取消。"
+                await update.effective_message.reply_text(prompt)
+                return
+            config = store.get_auto_reply_settings(user_id, auto_flow.account_id)
+            if not config:
+                auto_flows.pop(user_id, None)
+                await update.effective_message.reply_text("Account not found." if store.get_language(user_id) == "en" else "没有找到你的这个账号。")
+                return
+            if text.strip().casefold() in {"默认", "恢复默认", "default", "reset", "clear"}:
+                config["simple_reply"] = ""
+            else:
+                config["simple_reply"] = text
+            store.save_auto_reply_config(user_id, auto_flow.account_id, config)
+            store.audit(user_id, "auto_reply_simple_message_changed", auto_flow.account_id, "simple reply updated")
+            auto_flows.pop(user_id, None)
+            saved = "Reply saved." if store.get_language(user_id) == "en" else "自动回复内容已保存。"
+            await update.effective_message.reply_text(saved, reply_markup=menu_for_user(user_id))
             return
         if auto_flow.state == "template":
             if not text or len(text) > 1000:
@@ -607,7 +834,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             store.save_auto_reply_config(user_id, auto_flow.account_id, config)
             store.audit(user_id, "auto_reply_template_changed", auto_flow.account_id, f"scene={auto_flow.scene}")
             auto_flows.pop(user_id, None)
-            await update.effective_message.reply_text("场景模板已保存。支持 {name}、{time}、{product}。", reply_markup=MENU)
+            await update.effective_message.reply_text("场景模板已保存。支持 {name}、{time}、{product}。", reply_markup=menu_for_user(owner_id(update)))
             return
         if auto_flow.state == "product":
             if len(text) > 120:
@@ -622,7 +849,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             store.save_auto_reply_config(user_id, auto_flow.account_id, config)
             store.audit(user_id, "auto_reply_product_changed", auto_flow.account_id, "product updated")
             auto_flows.pop(user_id, None)
-            await update.effective_message.reply_text("{product} 的替换内容已保存。", reply_markup=MENU)
+            await update.effective_message.reply_text("{product} 的替换内容已保存。", reply_markup=menu_for_user(owner_id(update)))
             return
         if auto_flow.state == "thresholds":
             parts = text.split()
@@ -648,12 +875,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             auto_flows.pop(user_id, None)
             await update.effective_message.reply_text(
                 f"触发条件已保存：连续 {idle} 分钟无人工操作；未回复队列超过 {queue} 条；夜间 {start_hour:02d}:00–{end_hour:02d}:00。",
-                reply_markup=MENU,
+                reply_markup=menu_for_user(owner_id(update)),
             )
             return
     flow = flows.get(user_id)
     if not flow:
-        await update.effective_message.reply_text("请选择菜单功能，或发送 /help。", reply_markup=MENU)
+        await update.effective_message.reply_text("请选择菜单功能，或发送 /help。", reply_markup=menu_for_user(owner_id(update)))
         return
     if flow_is_expired(flow):
         expired_state = flow.state
@@ -800,7 +1027,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await update.effective_message.reply_text("格式：账号ID 新备注，例如 2 工作号")
             return
         ok = store.update_label(user_id, int(match.group(1)), match.group(2))
-        await update.effective_message.reply_text("备注已更新。" if ok else "没有找到你的这个账号。", reply_markup=MENU)
+        await update.effective_message.reply_text("备注已更新。" if ok else "没有找到你的这个账号。", reply_markup=menu_for_user(owner_id(update)))
         return
     if flow.state == "qr_wait":
         await update.effective_message.reply_text("请用 Telegram 官方客户端扫描刚才的二维码，或发送 /cancel。")
@@ -890,16 +1117,16 @@ async def submit_2fa_password(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_private(update):
+    if not await require_private(update, context.bot):
         return
     user = owner_id(update)
     if auto_flows.pop(user, None) is None:
         await cleanup_flow(user)
-    await update.effective_message.reply_text("当前操作已取消。", reply_markup=MENU)
+    await update.effective_message.reply_text("当前操作已取消。", reply_markup=menu_for_user(owner_id(update)))
 
 
 async def resend_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_private(update):
+    if not await require_private(update, context.bot):
         return
     user_id = owner_id(update)
     flow = flows.get(user_id)
@@ -990,7 +1217,7 @@ async def resend_code(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 async def code_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_private(update):
+    if not await require_private(update, context.bot):
         return
     user_id = owner_id(update)
     args = context.args
@@ -1033,7 +1260,7 @@ async def send_account_picker(update: Update, action: str) -> None:
             await update.effective_message.reply_text("没有找到属于你且号码完全匹配的已保存会话；不会查询其他账号。")
             return
     if not rows:
-        await update.effective_message.reply_text("先用 /add 或 /qr 添加你本人的账号。", reply_markup=MENU)
+        await update.effective_message.reply_text("先用 /add 或 /qr 添加你本人的账号。", reply_markup=menu_for_user(owner_id(update)))
         return
     titles = {
         "code": "要从哪个账号读取验证码？",
@@ -1113,7 +1340,7 @@ async def expire_displayed_code(message: Any) -> None:
 
 
 async def groups(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_private(update):
+    if not await require_private(update, context.bot):
         return
     owner = owner_id(update)
     current = store.list_groups(owner)
@@ -1121,23 +1348,23 @@ async def groups(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(
         "📁 账号分组\n" + "\n".join(lines) +
         "\n\n创建：/group_create 分组名\n移动：/move 账号ID 分组名",
-        reply_markup=MENU,
+        reply_markup=menu_for_user(owner_id(update)),
     )
 
 
 async def group_create(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_private(update):
+    if not await require_private(update, context.bot):
         return
     name = " ".join(context.args).strip()
     if not name:
         await update.effective_message.reply_text("格式：/group_create 分组名")
         return
     ok = store.create_group(owner_id(update), name)
-    await update.effective_message.reply_text("分组已创建。" if ok else "创建失败：名称为空或该分组已存在。", reply_markup=MENU)
+    await update.effective_message.reply_text("分组已创建。" if ok else "创建失败：名称为空或该分组已存在。", reply_markup=menu_for_user(owner_id(update)))
 
 
 async def move_account(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_private(update):
+    if not await require_private(update, context.bot):
         return
     if len(context.args) < 2:
         await update.effective_message.reply_text("格式：/move 账号ID 分组名")
@@ -1148,11 +1375,11 @@ async def move_account(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.effective_message.reply_text("账号 ID 必须是数字。")
         return
     ok = store.move_to_group(owner_id(update), account_id, " ".join(context.args[1:]))
-    await update.effective_message.reply_text("已移动账号。" if ok else "未找到你的账号或分组。", reply_markup=MENU)
+    await update.effective_message.reply_text("已移动账号。" if ok else "未找到你的账号或分组。", reply_markup=menu_for_user(owner_id(update)))
 
 
 async def devices(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_private(update):
+    if not await require_private(update, context.bot):
         return
     user_id = owner_id(update)
     if not context.args:
@@ -1188,7 +1415,7 @@ async def show_devices(user_id: int, account_id: int, message: Any) -> None:
             lines.append(f"• {device} {app} {country} · 最近活跃 {active} {current}".strip())
         store.audit(user_id, "devices_viewed", account_id, "authorization list")
         await message.reply_text("💻 Telegram 登录设备\n" + ("\n".join(lines) if lines else "未返回设备信息。") +
-            "\n\n此 MVP 仅查看设备；撤销陌生会话请在 Telegram 官方设置中操作。", reply_markup=MENU)
+            "\n\n此 MVP 仅查看设备；撤销陌生会话请在 Telegram 官方设置中操作。", reply_markup=menu_for_user(owner_id(update)))
     except Exception as exc:
         log.warning("Device listing failed (%s)", type(exc).__name__)
         await message.reply_text("无法读取设备列表；请检查会话是否仍有效。")
@@ -1197,7 +1424,7 @@ async def show_devices(user_id: int, account_id: int, message: Any) -> None:
 
 
 async def twofa(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_private(update):
+    if not await require_private(update, context.bot):
         return
     user_id = owner_id(update)
     if not context.args:
@@ -1226,7 +1453,7 @@ async def show_twofa(user_id: int, account_id: int, message: Any) -> None:
         await message.reply_text(
             f"🛡 该账号的两步验证：{status}。\n此 MVP 只读取状态，不读取或修改 2FA 密码。"
             "如需更改，请使用 Telegram 官方设置。" + ("建议开启强密码与恢复邮箱。" if not enabled else ""),
-            reply_markup=MENU,
+            reply_markup=menu_for_user(owner_id(update)),
         )
     except Exception as exc:
         log.warning("2FA status check failed (%s)", type(exc).__name__)
@@ -1236,7 +1463,7 @@ async def show_twofa(user_id: int, account_id: int, message: Any) -> None:
 
 
 async def search_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_private(update):
+    if not await require_private(update, context.bot):
         return
     flows[owner_id(update)] = Flow(state="search")
     await update.effective_message.reply_text("发送手机号片段、备注或分组名进行搜索。/cancel 取消。")
@@ -1246,8 +1473,7 @@ async def account_picker_callback(update: Update, context: ContextTypes.DEFAULT_
     query = update.callback_query
     if not query:
         return
-    if not await require_private(update):
-        await query.answer("无权使用此机器人。", show_alert=True)
+    if not await require_callback_access(update, query, context.bot):
         return
     parsed = parse_picker_callback(query.data)
     if not parsed:
@@ -1273,7 +1499,7 @@ async def account_picker_callback(update: Update, context: ContextTypes.DEFAULT_
 
 
 async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_private(update):
+    if not await require_private(update, context.bot):
         return
     query = " ".join(context.args).strip()
     if not query:
@@ -1289,12 +1515,12 @@ async def run_search(update: Update, query: str) -> None:
     store.audit(owner, "account_search", None, "search performed")
     await update.effective_message.reply_text(
         "🔎 搜索结果\n" + ("\n".join(format_account(r) for r in hits) if hits else "没有匹配的账号。"),
-        reply_markup=MENU,
+        reply_markup=menu_for_user(owner_id(update)),
     )
 
 
 async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_private(update):
+    if not await require_private(update, context.bot):
         return
     on = store.alerts_enabled(owner_id(update))
     state = "开启" if on else "关闭"
@@ -1305,27 +1531,28 @@ async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(
         f"🔔 安全通知：{state}\n{health}\n\n"
         "设置命令：/notify_on 或 /notify_off。开启后，机器人会在可用时提示 Telegram 官方服务账号发送了安全通知；不会转发通知原文或验证码。",
-        reply_markup=MENU,
+        reply_markup=menu_for_user(owner_id(update)),
     )
 
 
-def auto_account_picker(rows: list[dict[str, Any]]) -> InlineKeyboardMarkup:
+def auto_account_picker(rows: list[dict[str, Any]], language: str) -> InlineKeyboardMarkup:
     keyboard = [[InlineKeyboardButton(format_account(row), callback_data=f"auto:acct:{row['id']}")] for row in rows]
-    keyboard.append([InlineKeyboardButton("手动切换全部账号自动", callback_data="auto:all")])
     return InlineKeyboardMarkup(keyboard)
 
 
-def auto_settings_keyboard(account_id: int, enabled: bool, scene_mode: str) -> InlineKeyboardMarkup:
-    mode_label = "当前：自动分流（首次/夜间/忙碌）" if scene_mode == "auto" else "当前：成交/售后模式"
+def auto_settings_keyboard(account_id: int, enabled: bool, language: str) -> InlineKeyboardMarkup:
+    if language == "en":
+        toggle_label = "Turn auto-reply off" if enabled else "Turn auto-reply on"
+        edit_label, recent_label, back_label = "Change reply message", "Recent replies", "Back to accounts"
+    else:
+        toggle_label = "关闭自动回复" if enabled else "开启自动回复"
+        edit_label, recent_label, back_label = "修改回复内容", "查看最近回复", "返回账号列表"
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("关闭自动回复" if enabled else "开启此账号自动回复", callback_data=f"auto:toggle:{account_id}")],
-            [InlineKeyboardButton("编辑场景话术", callback_data=f"auto:templates:{account_id}")],
-            [InlineKeyboardButton("设置触发条件", callback_data=f"auto:limits:{account_id}"),
-             InlineKeyboardButton("设置 {product}", callback_data=f"auto:product:{account_id}")],
-            [InlineKeyboardButton(mode_label + "（切换）", callback_data=f"auto:mode:{account_id}:{'sales' if scene_mode == 'auto' else 'auto'}")],
-            [InlineKeyboardButton("最近自动回复标记", callback_data=f"auto:recent:{account_id}")],
-            [InlineKeyboardButton("返回账号列表", callback_data="auto:list")],
+            [InlineKeyboardButton(toggle_label, callback_data=f"auto:toggle:{account_id}")],
+            [InlineKeyboardButton(edit_label, callback_data=f"auto:content:{account_id}")],
+            [InlineKeyboardButton(recent_label, callback_data=f"auto:recent:{account_id}")],
+            [InlineKeyboardButton(back_label, callback_data="auto:list")],
         ]
     )
 
@@ -1340,15 +1567,19 @@ def auto_scene_keyboard(account_id: int) -> InlineKeyboardMarkup:
 
 
 async def auto_reply_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_private(update):
+    if not await require_private(update, context.bot):
         return
-    rows = store.list_accounts(owner_id(update))
+    owner = owner_id(update)
+    language = store.get_language(owner)
+    rows = store.list_accounts(owner)
     if not rows:
-        await update.effective_message.reply_text("先添加本人账号，再为单个账号开启自动回复。", reply_markup=MENU)
+        text = "Add your own Telegram account first." if language == "en" else "先添加本人账号，再开启自动回复。"
+        await update.effective_message.reply_text(text, reply_markup=menu_for_user(owner))
         return
+    prompt = "Choose an account. Auto-reply is OFF until you turn it on." if language == "en" else "选择账号。自动回复默认关闭，需你手动开启。"
     await update.effective_message.reply_text(
-        "🤖 自动回复设置\n请选择账号。默认关闭；只处理私聊，不回复群组或机器人。收到的消息正文不会保存。",
-        reply_markup=auto_account_picker(rows),
+        "🤖 Auto-reply\n" + prompt if language == "en" else "🤖 自动回复\n" + prompt,
+        reply_markup=auto_account_picker(rows, language),
     )
 
 
@@ -1356,41 +1587,35 @@ async def show_auto_reply_settings(message: Any, owner: int, account_id: int) ->
     config = store.get_auto_reply_settings(owner, account_id)
     row = store.get_account(owner, account_id)
     if not config or not row:
-        await message.reply_text("没有找到你的这个账号。")
+        await message.reply_text("Account not found." if store.get_language(owner) == "en" else "没有找到你的这个账号。")
         return
-    now = time.time()
-    reason = offline_reason(
-        config,
-        enabled=config["enabled"],
-        manual_auto=config["manual_auto"],
-        last_human_at=config["last_human_at"],
-        paused_until=config["paused_until"],
-        pending_count=config["pending_count"],
-        now=now,
-    )
-    local = local_datetime(now, config["tz_offset"])
-    status = "已开启" if config["enabled"] else "已关闭"
-    reason_labels = {"manual": "手动切换全部自动", "schedule": "夜间时段", "queue": "未回复队列超阈值", "idle": "空闲超时"}
-    active = f"当前离线触发：{reason_labels.get(reason, reason)}" if reason else "当前在线/未触发"
-    mode = "自动分流" if config["scene_mode"] == "auto" else "成交/售后"
-    await message.reply_text(
-        f"🤖 自动回复 · 账号 #{account_id}（{Store.mask_phone(row['phone'])}）\n"
-        f"状态：{status}；{active}\n"
-        f"人工活动：空闲 {config['idle_minutes']} 分钟触发；未回复队列 > {config['queue_threshold']} 条\n"
-        f"夜间：{config['start_hour']:02d}:00–{config['end_hour']:02d}:00（UTC{config['tz_offset']:+d}，现在 {local:%H:%M}）\n"
-        f"场景模式：{mode}；产品变量：{config['product'] or '未设置'}；当前未回复条数：{config['pending_count']}\n\n"
-        "人工从该账号发出消息后，会立即暂停自动回复并清除该联系人队列；暂停期间不触发自动回复。"
-        "夜间、空闲、队列和手动自动模式为 OR 关系。",
-        reply_markup=auto_settings_keyboard(account_id, config["enabled"], config["scene_mode"]),
-    )
+    language = store.get_language(owner)
+    status = ("ON" if config["enabled"] else "OFF") if language == "en" else ("已开启" if config["enabled"] else "已关闭")
+    reply_type = ("Custom message" if config["simple_reply"] else "Default message") if language == "en" else ("自定义内容" if config["simple_reply"] else "默认内容")
+    if language == "en":
+        text = (
+            f"🤖 Auto-reply · account #{account_id} ({Store.mask_phone(row['phone'])})\n"
+            f"Status: {status}\nReply: {reply_type}\n"
+            "When it replies: at night or when you have not replied for a while.\n\n"
+            "It sends messages from this account, only in private chats. It skips groups and bots.\n"
+            "Received message text is not stored. If you send a message yourself, auto-reply pauses."
+        )
+    else:
+        text = (
+            f"🤖 自动回复 · 账号 #{account_id}（{Store.mask_phone(row['phone'])}）\n"
+            f"状态：{status}\n回复内容：{reply_type}\n"
+            "触发方式：夜间或一段时间没回复时自动回复。\n\n"
+            "会由这个账号发消息，只处理私聊，不回复群组或机器人。\n"
+            "不会保存收到的消息内容；你手动发消息后会暂停自动回复。"
+        )
+    await message.reply_text(text, reply_markup=auto_settings_keyboard(account_id, config["enabled"], language))
 
 
 async def auto_reply_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     if not query:
         return
-    if not await require_private(update):
-        await query.answer("无权使用此机器人。", show_alert=True)
+    if not await require_callback_access(update, query, context.bot):
         return
     data = (query.data or "").split(":")
     owner = owner_id(update)
@@ -1403,10 +1628,12 @@ async def auto_reply_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     if action == "list":
         if message:
             rows = store.list_accounts(owner)
+            language = store.get_language(owner)
             if rows:
-                await message.reply_text("请选择要设置的账号：", reply_markup=auto_account_picker(rows))
+                prompt = "Choose an account:" if language == "en" else "请选择账号："
+                await message.reply_text(prompt, reply_markup=auto_account_picker(rows, language))
             else:
-                await message.reply_text("目前没有已添加的账号。")
+                await message.reply_text("No accounts added yet." if language == "en" else "目前没有已添加的账号。")
         return
     if action == "all":
         count = store.set_auto_reply_all(owner, True)
@@ -1449,6 +1676,15 @@ async def auto_reply_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         if message:
             await message.reply_text("选择要编辑的场景模板：", reply_markup=auto_scene_keyboard(account_id))
         return
+    if action == "content":
+        auto_flows[owner] = AutoFlow(state="simple_reply", account_id=account_id)
+        if message:
+            if store.get_language(owner) == "en":
+                prompt = "Send the reply message (up to 1,000 characters). Send “default” to restore the built-in replies, or /cancel to stop."
+            else:
+                prompt = "请发送自动回复内容（最多 1000 字）。发送“默认”可恢复默认话术，/cancel 可取消。"
+            await message.reply_text(prompt)
+        return
     if action == "edit" and len(data) == 4 and data[3] in SCENE_LABELS:
         auto_flows[owner] = AutoFlow(state="template", account_id=account_id, scene=data[3])
         if message:
@@ -1481,17 +1717,20 @@ async def auto_reply_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     if action == "recent":
         items = store.list_auto_reply_messages(owner, account_id, 20)
+        language = store.get_language(owner)
         if not items:
-            result = f"账号 #{account_id} 暂无自动回复记录。"
+            result = f"No auto-replies yet for account #{account_id}." if language == "en" else f"账号 #{account_id} 暂无自动回复记录。"
         else:
             lines = []
             for item in items:
                 when = datetime.fromtimestamp(item["created_at"], timezone.utc).strftime("%m-%d %H:%M UTC")
                 label = SCENE_LABELS.get(item["scene"], item["scene"] or "离线")
-                lines.append(
-                    f"• auto=1 · 对话 {item['peer_id']} · Telegram 消息 #{item['message_id']} · {label} · {when}"
-                )
-            result = f"账号 #{account_id} 最近自动回复（正文未保存）：\n" + "\n".join(lines)
+                if language == "en":
+                    lines.append(f"• Chat {item['peer_id']} · message #{item['message_id']} · {when}")
+                else:
+                    lines.append(f"• auto=1 · 对话 {item['peer_id']} · Telegram 消息 #{item['message_id']} · {label} · {when}")
+            heading = f"Recent auto-replies for account #{account_id} (message text is not stored):\n" if language == "en" else f"账号 #{account_id} 最近自动回复（正文未保存）：\n"
+            result = heading + "\n".join(lines)
         if message:
             await message.reply_text(result)
         return
@@ -1499,7 +1738,7 @@ async def auto_reply_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def auto_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_private(update):
+    if not await require_private(update, context.bot):
         return
     user = owner_id(update)
     count = store.set_auto_reply_all(user, True)
@@ -1510,23 +1749,23 @@ async def auto_all(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     store.audit(user, "auto_reply_manual_all_on", None, f"accounts={count}")
     await update.effective_message.reply_text(
         f"已将 {count} 个账号切换为手动自动模式。任一账号人工发消息后，该账号会立即暂停自动回复。",
-        reply_markup=MENU,
+        reply_markup=menu_for_user(owner_id(update)),
     )
 
 
 async def auto_all_off(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_private(update):
+    if not await require_private(update, context.bot):
         return
     user = owner_id(update)
     count = store.set_auto_reply_all(user, False)
     for row in store.list_accounts(user):
         await stop_monitor_if_unused(user, row["id"])
     store.audit(user, "auto_reply_all_off", None, f"accounts={count}")
-    await update.effective_message.reply_text(f"已关闭 {count} 个账号的自动回复。", reply_markup=MENU)
+    await update.effective_message.reply_text(f"已关闭 {count} 个账号的自动回复。", reply_markup=menu_for_user(owner_id(update)))
 
 
 async def notify_on(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_private(update):
+    if not await require_private(update, context.bot):
         return
     user = owner_id(update)
     store.set_alerts(user, True)
@@ -1534,17 +1773,17 @@ async def notify_on(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         session = store.get_session(user, row["id"])
         if session:
             start_monitor(user, row["id"], session, context.application)
-    await update.effective_message.reply_text("安全通知已开启。机器人仅发送提醒，不会转发 Telegram 消息内容。", reply_markup=MENU)
+    await update.effective_message.reply_text("安全通知已开启。机器人仅发送提醒，不会转发 Telegram 消息内容。", reply_markup=menu_for_user(owner_id(update)))
 
 
 async def notify_off(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_private(update):
+    if not await require_private(update, context.bot):
         return
     user = owner_id(update)
     store.set_alerts(user, False)
     for row in store.list_accounts(user):
         await stop_monitor_if_unused(user, row["id"])
-    await update.effective_message.reply_text("安全通知已关闭。", reply_markup=MENU)
+    await update.effective_message.reply_text("安全通知已关闭。", reply_markup=menu_for_user(owner_id(update)))
 
 
 async def stop_monitor_if_unused(user_id: int, account_id: int) -> None:
@@ -1656,7 +1895,7 @@ async def handle_auto_reply_event(event: Any, user_id: int, account_id: int, cli
                 manual_auto=latest["manual_auto"],
                 now=time.time(),
             )
-            template = latest["scenes"].get(scene) or latest["scenes"].get("offline", "稍后回复你。")
+            template = latest.get("simple_reply") or latest["scenes"].get(scene) or latest["scenes"].get("offline", "稍后回复你。")
             name = " ".join(
                 part for part in [getattr(sender, "first_name", ""), getattr(sender, "last_name", "")] if part
             ).strip() or "你好"
@@ -1719,32 +1958,32 @@ async def watch_account(user_id: int, account_id: int, session: str, application
 
 
 async def audit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_private(update):
+    if not await require_private(update, context.bot):
         return
     items = store.list_audit(owner_id(update), 20)
     if not items:
-        await update.effective_message.reply_text("暂时没有操作记录。", reply_markup=MENU)
+        await update.effective_message.reply_text("暂时没有操作记录。", reply_markup=menu_for_user(owner_id(update)))
         return
     lines = []
     for item in items:
         when = datetime.fromtimestamp(item["created_at"], timezone.utc).strftime("%m-%d %H:%M UTC")
         suffix = f" · 账号 #{item['account_id']}" if item["account_id"] else ""
         lines.append(f"• {when} · {item['action']}{suffix}")
-    await update.effective_message.reply_text("🧾 最近操作记录（只记录动作，不含验证码或密码）\n" + "\n".join(lines), reply_markup=MENU)
+    await update.effective_message.reply_text("🧾 最近操作记录（只记录动作，不含验证码或密码）\n" + "\n".join(lines), reply_markup=menu_for_user(owner_id(update)))
 
 
 async def trash(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_private(update):
+    if not await require_private(update, context.bot):
         return
     rows = [r for r in store.list_accounts(owner_id(update), include_deleted=True) if r["deleted_at"]]
     if not rows:
-        await update.effective_message.reply_text("回收站为空。删除账号使用 /delete 账号ID；恢复使用 /restore 账号ID。", reply_markup=MENU)
+        await update.effective_message.reply_text("回收站为空。删除账号使用 /delete 账号ID；恢复使用 /restore 账号ID。", reply_markup=menu_for_user(owner_id(update)))
         return
-    await update.effective_message.reply_text("🗑 回收站（仅你可见）\n" + "\n".join(format_account(r) for r in rows) + "\n\n恢复：/restore 账号ID", reply_markup=MENU)
+    await update.effective_message.reply_text("🗑 回收站（仅你可见）\n" + "\n".join(format_account(r) for r in rows) + "\n\n恢复：/restore 账号ID", reply_markup=menu_for_user(owner_id(update)))
 
 
 async def delete_account(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_private(update):
+    if not await require_private(update, context.bot):
         return
     if not context.args or not context.args[0].isdigit():
         await update.effective_message.reply_text("格式：/delete 账号ID（移入回收站，可恢复）")
@@ -1757,11 +1996,11 @@ async def delete_account(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         task.cancel()
         if client:
             await client.disconnect()
-    await update.effective_message.reply_text("账号已移入回收站；会话仍加密保留，可用 /restore 恢复。" if ok else "没有找到你的这个账号。", reply_markup=MENU)
+    await update.effective_message.reply_text("账号已移入回收站；会话仍加密保留，可用 /restore 恢复。" if ok else "没有找到你的这个账号。", reply_markup=menu_for_user(owner_id(update)))
 
 
 async def restore_account(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_private(update):
+    if not await require_private(update, context.bot):
         return
     if not context.args or not context.args[0].isdigit():
         await update.effective_message.reply_text("格式：/restore 账号ID")
@@ -1772,11 +2011,11 @@ async def restore_account(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         session = store.get_session(user, account_id)
         if session:
             start_monitor(user, account_id, session, context.application)
-    await update.effective_message.reply_text("账号已恢复。" if ok else "回收站中没有找到你的这个账号。", reply_markup=MENU)
+    await update.effective_message.reply_text("账号已恢复。" if ok else "回收站中没有找到你的这个账号。", reply_markup=menu_for_user(owner_id(update)))
 
 
 async def rename_account(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_private(update):
+    if not await require_private(update, context.bot):
         return
     if len(context.args) < 2 or not context.args[0].isdigit():
         await update.effective_message.reply_text("格式：/rename 账号ID 新备注")
@@ -1784,31 +2023,37 @@ async def rename_account(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     account_id = int(context.args[0])
     label = " ".join(context.args[1:]).strip()
     ok = store.update_label(owner_id(update), account_id, label)
-    await update.effective_message.reply_text("账号备注已更新。" if ok else "没有找到你的这个账号。", reply_markup=MENU)
+    await update.effective_message.reply_text("账号备注已更新。" if ok else "没有找到你的这个账号。", reply_markup=menu_for_user(owner_id(update)))
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_private(update):
+    if not await require_private(update, context.bot):
         return
-    await update.effective_message.reply_text(
-        "命令说明\n"
-        "/accounts — 我的账号\n/add — 先同意风险，再搜索/选择国家并输入号码进行手机号登录\n/qr — QR 登录\n"
-        "/resend — 仅在 Telegram 返回 next_type、等待结束后主动重发；最多 4 次，不自动连发\n"
-        "/code — 仅在本人手机号登录流程中，点选同号的本人已保存账号后读取 Telegram 登录码\n"
-        "/groups、/group_create 名称、/move 账号ID 分组名、/rename 账号ID 新备注\n/devices — 点选账号查看登录设备\n/2fa — 点选账号查看是否开启\n"
-        "/search 关键词 — 搜索备注/号码/分组\n/notify_on、/notify_off — 安全通知\n/audit — 操作记录\n"
-        "/autoreply — 按账号设置离线自动回复；/auto_all — 手动切换全部账号自动；/auto_all_off — 全部关闭\n"
-        "/delete 账号ID、/restore 账号ID — 回收站操作\n/consent — 确认理解登录托管风险\n/cancel — 取消当前流程\n\n"
-        "安全边界：仅白名单用户可用且仅私聊；每位用户只能操作自己添加的账号；登录前必须同意运营者可访问会话。"
-        "自动回复需逐号开启，只处理私聊、不回复群组；不会保存收到的消息正文，并有每人冷却和每日上限。"
-        "账号转交、代替他人登录及修改/查看 2FA 密码均不提供。",
-        reply_markup=MENU,
-    )
+    if store.get_language(owner_id(update)) == "en":
+        text = (
+            "Commands\n/accounts — my accounts\n/add — add your own Telegram account\n/qr — QR login\n"
+            "/code — retrieve a login code only from your matching saved account\n/resend — resend only when Telegram allows it\n"
+            "/groups — account groups\n/devices — login devices\n/2fa — 2FA status\n/search — find an account\n"
+            "/autoreply — simple per-account auto-reply settings\n/language — switch Chinese/English\n"
+            "/notify_on, /notify_off — security alerts\n/audit — activity\n/cancel — cancel the current step\n\n"
+            "Before first use, complete a one-time human check and join the official channel."
+            " Auto-reply is off by default, works only in private chats, and never stores incoming message text."
+        )
+    else:
+        text = (
+            "命令说明\n/accounts — 我的账号\n/add — 添加本人账号\n/qr — QR 登录\n"
+            "/resend — 仅在 Telegram 允许时重发验证码\n/code — 只从本人匹配的已保存账号读取登录码\n"
+            "/groups — 账号分组\n/devices — 登录设备\n/2fa — 2FA 状态\n/search — 搜索账号\n"
+            "/autoreply — 简单的逐账号自动回复设置\n/language — 切换中文/English\n"
+            "/notify_on、/notify_off — 安全通知\n/audit — 操作记录\n/cancel — 取消当前步骤\n\n"
+            "首次使用需完成一次人机验证并加入官方频道。自动回复默认关闭，只处理私聊，不保存收到的消息正文。"
+        )
+    await update.effective_message.reply_text(text, reply_markup=menu_for_user(owner_id(update)))
 
 
 async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if await require_private(update):
-        await update.effective_message.reply_text("未知命令，请发送 /help。", reply_markup=MENU)
+    if await require_private(update, context.bot):
+        await update.effective_message.reply_text("未知命令，请发送 /help。", reply_markup=menu_for_user(owner_id(update)))
 
 
 async def on_startup(application: Application) -> None:
@@ -1852,6 +2097,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 def main() -> None:
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(on_startup).post_shutdown(on_shutdown).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("language", language_command))
     app.add_handler(CommandHandler("accounts", accounts))
     app.add_handler(CommandHandler("add", add_command))
     app.add_handler(CommandHandler("qr", qr_start))
@@ -1877,6 +2123,9 @@ def main() -> None:
     app.add_handler(CommandHandler("rename", rename_account))
     app.add_handler(CommandHandler("cancel", cancel))
     app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CallbackQueryHandler(human_captcha_callback, pattern=r"^human:"))
+    app.add_handler(CallbackQueryHandler(channel_check_callback, pattern=r"^channel:"))
+    app.add_handler(CallbackQueryHandler(language_callback, pattern=r"^lang:"))
     app.add_handler(CallbackQueryHandler(country_picker_callback, pattern=r"^ctry:"))
     app.add_handler(CallbackQueryHandler(account_picker_callback, pattern=r"^acctpick:"))
     app.add_handler(CallbackQueryHandler(auto_reply_callback, pattern=r"^auto:"))
