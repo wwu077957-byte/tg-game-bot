@@ -110,8 +110,8 @@ class LoginFlowGuardTests(unittest.IsolatedAsyncioTestCase):
         chinese = [button.text for row in bot.qr_refresh_keyboard("zh").inline_keyboard for button in row]
         english = [button.text for row in bot.qr_refresh_keyboard("en").inline_keyboard for button in row]
 
-        self.assertIn("🔄 刷新二维码", chinese)
-        self.assertIn("🔄 Refresh QR code", english)
+        self.assertIn("🔁 刷新二维码", chinese)
+        self.assertIn("🔁 Refresh QR code", english)
         self.assertIn("刷新二维码", bot.qr_login_caption("zh"))
         self.assertIn("Refresh QR code", bot.qr_login_caption("en"))
 
@@ -166,7 +166,7 @@ class LoginFlowGuardTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(language=language):
                 markup = bot.menu_for(language)
                 labels = {button.text for row in markup.keyboard for button in row}
-                self.assertIn("🔳 QR 登录" if language == "zh" else "🔳 QR login", labels)
+                self.assertIn("🔒 QR 登录" if language == "zh" else "🔒 QR login", labels)
                 self.assertTrue(forbidden.isdisjoint(labels))
 
 

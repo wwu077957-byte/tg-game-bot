@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from cryptography.fernet import Fernet
 
@@ -35,10 +35,13 @@ class FakeEvent:
 class FakeClient:
     def __init__(self) -> None:
         self.sent: list[tuple[int, str]] = []
+        self.next_message_id = 900
 
     async def send_message(self, peer_id: int, text: str):
         self.sent.append((peer_id, text))
-        return SimpleNamespace(id=900)
+        message = SimpleNamespace(id=self.next_message_id)
+        self.next_message_id += 1
+        return message
 
 
 class FakeAccountReader:
@@ -73,6 +76,26 @@ class FakeGateBot:
         return SimpleNamespace(status=self.status)
 
 
+class FakeNotificationBot:
+    def __init__(self) -> None:
+        self.sent: list[dict[str, object]] = []
+
+    async def send_message(self, **kwargs: object):
+        self.sent.append(dict(kwargs))
+        return SimpleNamespace(message_id=len(self.sent))
+
+    async def delete_message(self, **_kwargs: object) -> None:
+        return None
+
+
+class FakeAuthorizationClient:
+    def __init__(self, authorizations: list[object]) -> None:
+        self.authorizations = authorizations
+
+    async def __call__(self, _request: object):
+        return SimpleNamespace(authorizations=self.authorizations)
+
+
 class FakeGateQuery:
     def __init__(self, data: str, message: FakeGateMessage) -> None:
         self.data = data
@@ -83,9 +106,24 @@ class FakeGateQuery:
         self.answers.append((args, dict(kwargs)))
 
 
+class FakeFallbackMessage(FakeGateMessage):
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls: list[tuple[str, dict[str, object]]] = []
+
+    async def reply_text(self, text: str, **kwargs: object) -> None:
+        self.calls.append((text, dict(kwargs)))
+        if len(self.calls) == 1:
+            from telegram.error import BadRequest
+
+            raise BadRequest("Bad Request: custom emoji unavailable")
+        self.replies.append((text, dict(kwargs)))
+
+
 class AutoReplyBotTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.previous_store = bot.store
+        self.previous_custom_emoji_enabled = bot.CUSTOM_EMOJI_ENABLED
         self.tmp = tempfile.TemporaryDirectory()
         self.store = Store(
             str(Path(self.tmp.name) / "test.sqlite3"),
@@ -96,12 +134,14 @@ class AutoReplyBotTests(unittest.IsolatedAsyncioTestCase):
         bot.auto_reply_locks.clear()
         bot.auto_sending_peers.clear()
         bot.pending_human_challenges.clear()
+        bot.CUSTOM_EMOJI_ENABLED = False
 
     def tearDown(self) -> None:
         bot.store = self.previous_store
         bot.auto_reply_locks.clear()
         bot.auto_sending_peers.clear()
         bot.pending_human_challenges.clear()
+        bot.CUSTOM_EMOJI_ENABLED = self.previous_custom_emoji_enabled
         self.tmp.cleanup()
 
     def test_account_labels_follow_language(self) -> None:
@@ -110,11 +150,84 @@ class AutoReplyBotTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Group: Friends", bot.format_account(row, "en"))
         self.assertIn("分组：Friends", bot.format_account(row, "zh"))
 
+    def test_account_list_links_display_name_and_offers_username_id_button(self) -> None:
+        row = self.store.get_account(101, self.account_id)
+        text, entities, keyboard = bot.build_account_list(
+            [row],
+            [{"id": 8351483076, "username": "v8erx", "display_name": "Nora 🐈"}],
+            "en",
+        )
+
+        self.assertIn("#1", text)
+        self.assertIn("Nora 🐈", text)
+        self.assertEqual(len(entities), 1)
+        entity = entities[0]
+        name_start = text.index("Nora 🐈")
+        self.assertEqual(entity.offset, bot.utf16_code_units(text[:name_start]))
+        self.assertEqual(entity.length, bot.utf16_code_units("Nora 🐈"))
+        self.assertEqual(entity.url, "tg://user?id=8351483076")
+        button = keyboard.inline_keyboard[0][0]
+        self.assertEqual(button.callback_data, f"acctinfo:{self.account_id}")
+        self.assertIn("Username & ID", button.text)
+
+    async def test_account_info_callback_shows_username_id_and_profile_link(self) -> None:
+        self.store.mark_human_verified(101)
+        message = FakeGateMessage()
+        query = FakeGateQuery(f"acctinfo:{self.account_id}", message)
+        update = SimpleNamespace(
+            callback_query=query,
+            effective_user=SimpleNamespace(id=101),
+            effective_chat=SimpleNamespace(type="private"),
+            effective_message=message,
+        )
+        identity = {"id": 8351483076, "username": "v8erx", "display_name": "Nora 🐈"}
+        with patch.object(bot, "read_account_identity", new=AsyncMock(return_value=identity)):
+            await bot.account_info_callback(update, SimpleNamespace(bot=FakeGateBot("member")))
+
+        self.assertEqual(len(message.replies), 1)
+        text, kwargs = message.replies[0]
+        self.assertIn("@v8erx", text)
+        self.assertIn("8351483076", text)
+        self.assertEqual(kwargs["entities"][0].url, "tg://user?id=8351483076")
+        self.assertEqual(len(query.answers), 1)
+
+    async def test_account_info_callback_rejects_non_owner(self) -> None:
+        message = FakeGateMessage()
+        query = FakeGateQuery(f"acctinfo:{self.account_id}", message)
+        update = SimpleNamespace(
+            callback_query=query,
+            effective_user=SimpleNamespace(id=202),
+            effective_chat=SimpleNamespace(type="private"),
+            effective_message=message,
+        )
+        lookup = AsyncMock(return_value={"id": 8351483076, "username": "v8erx", "display_name": "Nora"})
+        with patch.object(bot, "read_account_identity", lookup):
+            await bot.account_info_callback(update, SimpleNamespace(bot=FakeGateBot("member")))
+
+        lookup.assert_not_awaited()
+        self.assertFalse(message.replies)
+        self.assertTrue(query.answers[0][1].get("show_alert"))
+
+    async def test_profile_link_entity_coexists_with_custom_emoji(self) -> None:
+        bot.CUSTOM_EMOJI_ENABLED = True
+        text = "👤 Nora 🐈"
+        start = text.index("Nora")
+        link = bot.profile_text_link(text, start, len(text), 8351483076)
+        message = FakeGateMessage()
+
+        await bot.reply_ui_text(message, text, entities=[link])
+
+        entities = message.replies[0][1]["entities"]
+        self.assertEqual(len(entities), 2)
+        self.assertEqual(entities[0].type, bot.MessageEntity.TEXT_LINK)
+        self.assertEqual(entities[0].url, "tg://user?id=8351483076")
+        self.assertEqual(entities[1].type, bot.MessageEntity.CUSTOM_EMOJI)
+
     def test_auto_reply_scene_labels_use_language_without_changing_templates(self) -> None:
         english = [button.text for row in bot.auto_scene_keyboard(1, "en").inline_keyboard for button in row]
         chinese = [button.text for row in bot.auto_scene_keyboard(1, "zh").inline_keyboard for button in row]
-        self.assertIn("First contact/welcome", english)
-        self.assertIn("首次接触/欢迎语", chinese)
+        self.assertIn("👤 First contact/welcome", english)
+        self.assertIn("👤 首次接触/欢迎语", chinese)
         self.assertEqual(bot.scene_labels("en")["welcome"], "First contact/welcome")
         self.assertIn("你好", bot.store.get_auto_reply_settings(101, self.account_id)["scenes"]["welcome"])
 
@@ -174,6 +287,166 @@ class AutoReplyBotTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(bot.asyncio, "sleep", new=no_sleep):
             await bot.handle_auto_reply_event(FakeEvent(peer_id=7003, message_id=15), 101, self.account_id, client)
         self.assertEqual(client.sent, [(7003, "Hi Ada Lovelace, I will get back to you soon.")])
+
+    async def test_every_inbound_message_is_replied_to_after_idle_without_queue_or_rate_caps(self) -> None:
+        self.store.set_auto_reply_enabled(101, self.account_id, True, manual_auto=False, now=20_000)
+        config = self.store.get_auto_reply_settings(101, self.account_id)
+        config.update({
+            "idle_minutes": 1,
+            "queue_threshold": 0,
+            "start_hour": 0,
+            "end_hour": 0,
+            "cooldown_seconds": 0,
+            "daily_cap": 0,
+            "simple_reply": "Received; I will get back to you soon.",
+        })
+        self.store.save_auto_reply_config(101, self.account_id, config)
+        client = FakeClient()
+
+        async def no_sleep(_seconds: float) -> None:
+            return None
+
+        with patch.object(bot.asyncio, "sleep", new=no_sleep):
+            await bot.handle_auto_reply_event(FakeEvent(peer_id=7001, message_id=20), 101, self.account_id, client)
+            await bot.handle_auto_reply_event(FakeEvent(peer_id=7001, message_id=21), 101, self.account_id, client)
+        self.assertEqual(client.sent, [
+            (7001, "Received; I will get back to you soon."),
+            (7001, "Received; I will get back to you soon."),
+        ])
+
+    async def test_context_ai_is_used_only_for_existing_private_chats(self) -> None:
+        self.store.set_auto_reply_enabled(101, self.account_id, True, manual_auto=False, now=20_000)
+        config = self.store.get_auto_reply_settings(101, self.account_id)
+        config.update({
+            "idle_minutes": 1,
+            "queue_threshold": 0,
+            "start_hour": 0,
+            "end_hour": 0,
+            "cooldown_seconds": 0,
+            "daily_cap": 0,
+            "simple_reply": "Fixed message for new contacts.",
+            "contextual_replies": True,
+        })
+        self.store.save_auto_reply_config(101, self.account_id, config)
+        client = FakeClient()
+        generate = AsyncMock(return_value="Context-aware reply.")
+        recent = AsyncMock(return_value=[{"role": "user", "content": "Can we meet tomorrow?"}])
+
+        async def no_sleep(_seconds: float) -> None:
+            return None
+
+        with (
+            patch.object(bot.asyncio, "sleep", new=no_sleep),
+            patch.object(bot, "generate_contextual_reply", generate),
+            patch.object(bot, "recent_private_context", recent),
+            patch.object(bot, "DEEPSEEK_API_KEY", "unit-test-key"),
+        ):
+            await bot.handle_auto_reply_event(FakeEvent(peer_id=7100, message_id=1), 101, self.account_id, client)
+            await bot.handle_auto_reply_event(FakeEvent(peer_id=7100, message_id=2), 101, self.account_id, client)
+
+        self.assertEqual(client.sent, [
+            (7100, "Fixed message for new contacts."),
+            (7100, "Context-aware reply."),
+        ])
+        generate.assert_awaited_once()
+        recent.assert_awaited_once()
+
+    async def test_owner_private_and_auto_reply_alerts_exclude_message_text(self) -> None:
+        self.store.set_language(101, "en")
+        self.store.set_auto_reply_enabled(101, self.account_id, True, manual_auto=False, now=20_000)
+        config = self.store.get_auto_reply_settings(101, self.account_id)
+        config.update({
+            "idle_minutes": 1,
+            "queue_threshold": 0,
+            "start_hour": 0,
+            "end_hour": 0,
+            "cooldown_seconds": 0,
+            "daily_cap": 0,
+            "simple_reply": "Received.",
+            "notify_private_messages": True,
+            "notify_auto_reply_sent": True,
+        })
+        self.store.save_auto_reply_config(101, self.account_id, config)
+        event = FakeEvent(peer_id=7200, message_id=8)
+        event.message.message = "PRIVATE BODY with login code 847293"
+        client = FakeClient()
+        owner_bot = FakeNotificationBot()
+        application = SimpleNamespace(bot=owner_bot)
+
+        async def no_sleep(_seconds: float) -> None:
+            return None
+
+        with patch.object(bot.asyncio, "sleep", new=no_sleep):
+            await bot.handle_auto_reply_event(event, 101, self.account_id, client, application)
+
+        self.assertEqual(len(owner_bot.sent), 2)
+        notifications = [str(item["text"]) for item in owner_bot.sent]
+        self.assertIn("new private message", notifications[0])
+        self.assertIn("sent an automatic reply", notifications[1])
+        for notification in notifications:
+            self.assertNotIn("PRIVATE BODY", notification)
+            self.assertNotIn("847293", notification)
+        self.assertTrue(all(item["chat_id"] == 101 for item in owner_bot.sent))
+
+    async def test_new_device_check_sets_silent_baseline_then_alerts_owner(self) -> None:
+        self.store.set_language(101, "en")
+        config = self.store.get_auto_reply_settings(101, self.account_id)
+        config["notify_new_device"] = True
+        self.store.save_auto_reply_config(101, self.account_id, config)
+        client = FakeAuthorizationClient([
+            SimpleNamespace(hash=111, device_model="Chrome 152", app_name="Telegram Web", app_version="1.0", platform="Web", ip="203.0.113.4", country="Example")
+        ])
+        owner_bot = FakeNotificationBot()
+        application = SimpleNamespace(bot=owner_bot)
+
+        self.assertFalse(await bot.check_new_device_authorizations(client, 101, self.account_id, application))
+        self.assertEqual(owner_bot.sent, [])
+        client.authorizations.append(
+            SimpleNamespace(hash=222, device_model="Firefox 150", app_name="Telegram Web", app_version="1.0", platform="Web", ip="198.51.100.7", country="Example")
+        )
+        self.assertTrue(await bot.check_new_device_authorizations(client, 101, self.account_id, application))
+        self.assertEqual(len(owner_bot.sent), 1)
+        text = str(owner_bot.sent[0]["text"])
+        self.assertIn("new login", text)
+        self.assertIn("Firefox 150", text)
+        self.assertNotIn("198.51.100.7", text)
+        self.assertNotIn("Example", text)
+
+    async def test_custom_emoji_permission_failure_retries_with_unicode_fallback(self) -> None:
+        bot.CUSTOM_EMOJI_ENABLED = True
+        markup = bot.InlineKeyboardMarkup(
+            [[bot.make_inline_button("🔔 Alerts", callback_data="alerts")]]
+        )
+        message = FakeFallbackMessage()
+
+        await bot.reply_ui_text(message, "🔔 Alerts are ready.", reply_markup=markup)
+
+        self.assertEqual(len(message.calls), 2)
+        self.assertTrue(message.calls[0][1].get("entities"))
+        self.assertEqual(message.replies[0][0], "🔔 Alerts are ready.")
+        fallback_button = message.replies[0][1]["reply_markup"].inline_keyboard[0][0]
+        self.assertEqual(fallback_button.text, "🔔 Alerts")
+        self.assertFalse(getattr(fallback_button, "icon_custom_emoji_id", None))
+        self.assertFalse(bot.CUSTOM_EMOJI_ENABLED)
+
+    async def test_manual_outgoing_message_immediately_pauses_auto_replies(self) -> None:
+        self.store.set_auto_reply_enabled(101, self.account_id, True, manual_auto=False, now=20_000)
+        config = self.store.get_auto_reply_settings(101, self.account_id)
+        config.update({"idle_minutes": 1, "queue_threshold": 0, "start_hour": 0, "end_hour": 0,
+                       "cooldown_seconds": 0, "daily_cap": 0, "simple_reply": "Received."})
+        self.store.save_auto_reply_config(101, self.account_id, config)
+        client = FakeClient()
+
+        async def no_sleep(_seconds: float) -> None:
+            return None
+
+        with patch.object(bot.asyncio, "sleep", new=no_sleep):
+            await bot.handle_auto_reply_event(FakeEvent(peer_id=7001, message_id=30), 101, self.account_id, client)
+            await bot.handle_auto_reply_event(
+                FakeEvent(peer_id=7002, message_id=31, outgoing=True), 101, self.account_id, client
+            )
+            await bot.handle_auto_reply_event(FakeEvent(peer_id=7001, message_id=32), 101, self.account_id, client)
+        self.assertEqual(client.sent, [(7001, "Received.")])
 
     def test_channel_membership_status_requires_actual_membership(self) -> None:
         self.assertTrue(bot.is_channel_member(SimpleNamespace(status="member")))

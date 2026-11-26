@@ -29,7 +29,7 @@ PHONE_CODE_MIN_INTERVAL_SECONDS = 45
 class Store:
     """SQLite store; session blobs and identifying account metadata are Fernet-encrypted."""
 
-    METADATA_SCHEMA_VERSION = 3
+    METADATA_SCHEMA_VERSION = 4
 
     def __init__(self, db_path: str, encryption_key: str) -> None:
         if not encryption_key:
@@ -182,6 +182,12 @@ class Store:
                 );
                 CREATE INDEX IF NOT EXISTS idx_auto_reply_messages_account_time
                     ON auto_reply_messages(account_id, created_at DESC);
+                CREATE TABLE IF NOT EXISTS telegram_authorization_snapshots (
+                    account_id INTEGER PRIMARY KEY,
+                    fingerprints_json TEXT NOT NULL,
+                    updated_at REAL NOT NULL,
+                    FOREIGN KEY(account_id) REFERENCES accounts(id) ON DELETE CASCADE
+                );
                 """
             )
             version = int(conn.execute("PRAGMA user_version").fetchone()[0])
@@ -193,7 +199,7 @@ class Store:
                 conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
                 conn.execute("VACUUM")
             if version < self.METADATA_SCHEMA_VERSION:
-                # Version 3 adds new tables only; do not encrypt v2 metadata again.
+                # Version 4 adds an authorization snapshot table; do not encrypt v2 metadata again.
                 conn.execute(f"PRAGMA user_version = {self.METADATA_SCHEMA_VERSION}")
                 conn.commit()
             try:
@@ -531,11 +537,13 @@ class Store:
             ).fetchone()
             if not row or not row["enabled"] or float(row["paused_until"] or 0) > current:
                 return False
-            if current - float(row["last_auto_reply_at"] or 0) < max(60, int(cooldown_seconds)):
-                if float(row["last_auto_reply_at"] or 0) > 0:
-                    return False
+            last_auto_reply_at = float(row["last_auto_reply_at"] or 0)
+            cooldown_limit = max(0, int(cooldown_seconds))
+            if cooldown_limit > 0 and last_auto_reply_at > 0 and current - last_auto_reply_at < cooldown_limit:
+                return False
             today_count = int(row["daily_count"] or 0) if row["daily_day"] == local_day else 0
-            if today_count >= max(1, int(daily_cap)):
+            daily_limit = max(0, int(daily_cap))
+            if daily_limit > 0 and today_count >= daily_limit:
                 return False
             conn.execute(
                 "UPDATE auto_reply_contacts SET last_auto_reply_at = ?, daily_day = ?, daily_count = ? "
@@ -689,6 +697,55 @@ class Store:
         with self._connect() as conn:
             row = conn.execute("SELECT security_alerts FROM settings WHERE owner_id = ?", (owner_id,)).fetchone()
         return bool(row[0]) if row else True
+
+    def update_authorization_snapshot(
+        self, owner_id: int, account_id: int, authorization_hashes: list[int] | tuple[int, ...]
+    ) -> set[int]:
+        """Persist keyed fingerprints and return only newly observed authorization IDs."""
+        identifiers: dict[str, int] = {}
+        for value in authorization_hashes:
+            try:
+                authorization_id = int(value)
+            except (TypeError, ValueError):
+                continue
+            if authorization_id <= 0:
+                continue
+            digest = hmac.new(
+                self._scope_key,
+                b"telegram-authorization:" + str(authorization_id).encode("ascii"),
+                hashlib.sha256,
+            ).hexdigest()
+            identifiers[digest] = authorization_id
+
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            account = conn.execute(
+                "SELECT 1 FROM accounts WHERE owner_id = ? AND id = ? AND deleted_at IS NULL",
+                (owner_id, account_id),
+            ).fetchone()
+            if not account:
+                return set()
+            row = conn.execute(
+                "SELECT fingerprints_json FROM telegram_authorization_snapshots WHERE account_id = ?",
+                (account_id,),
+            ).fetchone()
+            encoded = json.dumps(sorted(identifiers), separators=(",", ":"))
+            if not row:
+                conn.execute(
+                    "INSERT INTO telegram_authorization_snapshots(account_id, fingerprints_json, updated_at) VALUES(?,?,?)",
+                    (account_id, encoded, time.time()),
+                )
+                return set()
+            try:
+                previous = set(json.loads(row["fingerprints_json"]))
+            except (TypeError, ValueError):
+                previous = set(identifiers)
+            new_ids = {identifier for fingerprint, identifier in identifiers.items() if fingerprint not in previous}
+            conn.execute(
+                "UPDATE telegram_authorization_snapshots SET fingerprints_json = ?, updated_at = ? WHERE account_id = ?",
+                (encoded, time.time(), account_id),
+            )
+            return new_ids
 
     def get_language(self, owner_id: int) -> str:
         with self._connect() as conn:

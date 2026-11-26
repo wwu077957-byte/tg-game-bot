@@ -78,6 +78,18 @@ class AutoReplyLogicTests(unittest.TestCase):
         self.assertEqual(normalize_config({"simple_reply": "hello"})["simple_reply"], "hello")
         self.assertEqual(len(normalize_config({"simple_reply": "x" * 1100})["simple_reply"]), 1000)
 
+    def test_zero_queue_threshold_disables_queue_trigger(self) -> None:
+        config = normalize_config({"idle_minutes": 15, "queue_threshold": 0, "start_hour": 0, "end_hour": 0})
+        self.assertEqual(config["queue_threshold"], 0)
+        self.assertIsNone(offline_reason(
+            config, enabled=True, manual_auto=False, last_human_at=1_000,
+            paused_until=0, pending_count=50, now=1_059,
+        ))
+        self.assertEqual(offline_reason(
+            config, enabled=True, manual_auto=False, last_human_at=1_000,
+            paused_until=0, pending_count=0, now=1_900,
+        ), "idle")
+
 
 class AutoReplyStoreTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -153,6 +165,19 @@ class AutoReplyStoreTests(unittest.TestCase):
         self.assertEqual(self.store.list_auto_reply_messages(101, self.account_id)[0]["scene"], "night")
         self.assertEqual(self.store.auto_reply_pending_count(101, self.account_id), 0)
 
+    def test_zero_cooldown_and_daily_cap_allow_each_distinct_inbound(self) -> None:
+        self.enable()
+        for message_id, now in ((10, 10_000), (11, 10_001)):
+            incoming = self.store.record_auto_reply_incoming(101, self.account_id, 7001, message_id, now=now)
+            self.assertTrue(incoming["accepted"])
+            self.assertTrue(self.store.claim_auto_reply(
+                101, self.account_id, 7001, cooldown_seconds=0, daily_cap=0,
+                local_day="20261126", now=now,
+            ))
+            self.assertTrue(self.store.record_auto_reply_sent(
+                101, self.account_id, 7001, 100 + message_id, "offline", now=now + 0.1,
+            ))
+
     def test_manual_all_and_takeover_state_are_persistent_and_account_scoped(self) -> None:
         second_id = self.store.add_account(101, "+15551234568", "", "another-session")
         self.assertEqual(self.store.set_auto_reply_all(101, True, now=5_000), 2)
@@ -180,7 +205,7 @@ class AutoReplyStoreTests(unittest.TestCase):
         result = upgraded.get_auto_reply_settings(101, self.account_id)
         self.assertEqual(result["product"], "keep-encrypted-config")
         with sqlite3.connect(self.db) as conn:
-            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 3)
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 4)
 
 
 if __name__ == "__main__":

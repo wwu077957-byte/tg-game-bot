@@ -284,6 +284,20 @@ class StoreTests(unittest.TestCase):
         for plain in (b"+15550001111", b"Old Note", b"Old Group", b"old_action", b"old_detail"):
             self.assertNotIn(plain, (phone, label, action, detail, group_name))
 
+    def test_authorization_snapshot_is_owner_scoped_and_stores_only_fingerprints(self) -> None:
+        account_id = self.store.add_account(101, "+15551234567", "", "session")
+        self.assertEqual(self.store.update_authorization_snapshot(101, account_id, [99887766]), set())
+        self.assertEqual(self.store.update_authorization_snapshot(101, account_id, [99887766]), set())
+        self.assertEqual(self.store.update_authorization_snapshot(202, account_id, [11223344]), set())
+        self.assertEqual(self.store.update_authorization_snapshot(101, account_id, [99887766, 11223344]), {11223344})
+        with sqlite3.connect(self.db) as conn:
+            stored = conn.execute(
+                "SELECT fingerprints_json FROM telegram_authorization_snapshots WHERE account_id = ?",
+                (account_id,),
+            ).fetchone()[0]
+        self.assertNotIn("99887766", stored)
+        self.assertNotIn("11223344", stored)
+
     def test_missing_encryption_key_fails_closed(self) -> None:
         with self.assertRaises(RuntimeError):
             Store(str(Path(self.tmp.name) / "missing.sqlite3"), "")

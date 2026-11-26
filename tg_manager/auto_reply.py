@@ -26,6 +26,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "scenes": DEFAULT_SCENES,
     "cooldown_seconds": 1800,
     "daily_cap": 3,
+    "contextual_replies": False,
+    "notify_private_messages": False,
+    "notify_auto_reply_sent": False,
+    "notify_new_device": False,
 }
 
 SCENE_LABELS = {
@@ -68,15 +72,17 @@ def normalize_config(config: dict[str, Any] | None) -> dict[str, Any]:
                 if key in _ALLOWED_SCENES and isinstance(value, str):
                     result["scenes"][key] = value[:1000]
     result["idle_minutes"] = _clamp_int(result.get("idle_minutes"), 15, 1, 1440)
-    result["queue_threshold"] = _clamp_int(result.get("queue_threshold"), 3, 1, 100)
+    result["queue_threshold"] = _clamp_int(result.get("queue_threshold"), 3, 0, 100)
     result["start_hour"] = _clamp_int(result.get("start_hour"), 23, 0, 23)
     result["end_hour"] = _clamp_int(result.get("end_hour"), 9, 0, 23)
     result["tz_offset"] = _clamp_int(result.get("tz_offset"), 8, -12, 14)
     result["product"] = str(result.get("product") or "")[:120]
     result["simple_reply"] = str(result.get("simple_reply") or "")[:1000]
     result["scene_mode"] = result.get("scene_mode") if result.get("scene_mode") in {"auto", "sales"} else "auto"
-    result["cooldown_seconds"] = _clamp_int(result.get("cooldown_seconds"), 1800, 60, 86400)
-    result["daily_cap"] = _clamp_int(result.get("daily_cap"), 3, 1, 20)
+    result["cooldown_seconds"] = _clamp_int(result.get("cooldown_seconds"), 1800, 0, 86400)
+    result["daily_cap"] = _clamp_int(result.get("daily_cap"), 3, 0, 20)
+    for key in ("contextual_replies", "notify_private_messages", "notify_auto_reply_sent", "notify_new_device"):
+        result[key] = result.get(key) is True
     return result
 
 
@@ -128,7 +134,7 @@ def offline_reason(
         return "manual"
     if is_night(current, config):
         return "schedule"
-    if pending_count > int(config["queue_threshold"]):
+    if int(config["queue_threshold"]) > 0 and pending_count > int(config["queue_threshold"]):
         return "queue"
     if last_human_at and current - last_human_at >= int(config["idle_minutes"]) * 60:
         return "idle"
