@@ -6,9 +6,9 @@ from typing import Any
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
-ACCOUNT_PICKER_ACTIONS = frozenset({"code", "devices", "twofa"})
+ACCOUNT_PICKER_ACTIONS = frozenset({"devices", "twofa"})
 MAX_ACCOUNT_ID = 2**63 - 1
-_CALLBACK_RE = re.compile(r"^acctpick:(code|devices|twofa):([1-9][0-9]{0,18})$")
+_CALLBACK_RE = re.compile(r"^acctpick:(devices|twofa):([1-9][0-9]{0,18})$")
 
 
 def make_picker_callback(action: str, account_id: int) -> str:

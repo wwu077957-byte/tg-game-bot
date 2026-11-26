@@ -7,22 +7,24 @@ from tg_manager.picker import build_account_picker, make_picker_callback, parse_
 
 class AccountPickerTests(unittest.TestCase):
     def test_callback_round_trip_for_supported_actions(self) -> None:
-        for action in ("code", "devices", "twofa"):
+        for action in ("devices", "twofa"):
             with self.subTest(action=action):
                 callback = make_picker_callback(action, 42)
                 self.assertEqual(parse_picker_callback(callback), (action, 42))
 
     def test_rejects_unknown_or_malformed_callbacks(self) -> None:
-        for callback in (None, "", "acctpick:delete:1", "acctpick:devices:0", "acctpick:twofa:-1", "acctpick:code:1:2", "acctpick:code:999999999999999999999999999999999"):
+        for callback in (None, "", "acctpick:code:1", "acctpick:delete:1", "acctpick:devices:0", "acctpick:twofa:-1", "acctpick:devices:1:2", "acctpick:twofa:999999999999999999999999999999999"):
             with self.subTest(callback=callback):
                 self.assertIsNone(parse_picker_callback(callback))
         with self.assertRaises(ValueError):
             make_picker_callback("delete", 1)
         with self.assertRaises(ValueError):
-            make_picker_callback("code", 0)
+            make_picker_callback("code", 1)
         with self.assertRaises(ValueError):
-            make_picker_callback("code", 2**63)
-        self.assertIsNone(parse_picker_callback(f"acctpick:code:{2**63}"))
+            make_picker_callback("devices", 0)
+        with self.assertRaises(ValueError):
+            make_picker_callback("twofa", 2**63)
+        self.assertIsNone(parse_picker_callback(f"acctpick:twofa:{2**63}"))
 
     def test_keyboard_uses_only_the_supplied_owner_rows(self) -> None:
         rows = [

@@ -23,23 +23,23 @@ from tg_manager import bot  # noqa: E402
 
 
 class FakeMessage:
-    def __init__(self) -> None:
+    def __init__(self, text: str = "") -> None:
+        self.text = text
         self.replies: list[str] = []
 
     async def reply_text(self, text: str, **kwargs: object) -> None:
         self.replies.append(text)
 
 
-class FakeCallbackQuery:
-    def __init__(self, data: str) -> None:
-        self.data = data
-        self.answers: list[tuple[tuple[object, ...], dict[str, object]]] = []
+class HandlerRecorder:
+    def __init__(self) -> None:
+        self.handlers: list[object] = []
 
-    async def answer(self, *args: object, **kwargs: object) -> None:
-        self.answers.append((args, kwargs))
+    def add_handler(self, handler: object) -> None:
+        self.handlers.append(handler)
 
 
-class LoginFlowExpiryGuardTests(unittest.IsolatedAsyncioTestCase):
+class LoginFlowGuardTests(unittest.IsolatedAsyncioTestCase):
     user_id = 101
 
     def setUp(self) -> None:
@@ -51,62 +51,80 @@ class LoginFlowExpiryGuardTests(unittest.IsolatedAsyncioTestCase):
     def tearDown(self) -> None:
         bot.flows.pop(self.user_id, None)
 
-    def expired_code_flow(self) -> bot.Flow:
-        return bot.Flow(
-            state="code",
-            phone="+14155552671",
-            phone_code_hash="expired-hash",
-            started_at=time.monotonic() - bot.FLOW_TTL_SECONDS - 1,
-        )
-
-    def update(self, message: FakeMessage | None = None, query: FakeCallbackQuery | None = None):
+    def update(self, message: FakeMessage | None = None):
         return SimpleNamespace(
             effective_user=SimpleNamespace(id=self.user_id),
             effective_chat=SimpleNamespace(type="private"),
             effective_message=message or FakeMessage(),
-            callback_query=query,
         )
 
-    async def test_resend_rejects_expired_login_hash(self) -> None:
+    async def test_qr_command_starts_with_explicit_consent(self) -> None:
         message = FakeMessage()
-        bot.flows[self.user_id] = self.expired_code_flow()
+        await bot.qr_start(self.update(message), SimpleNamespace(bot=object()))
 
-        await bot.resend_code(self.update(message), SimpleNamespace(bot=object()))
+        self.assertEqual(bot.flows[self.user_id].state, "consent")
+        self.assertTrue(any("/consent" in text for text in message.replies))
+        self.assertTrue(any("二维码" in text or "QR" in text for text in message.replies))
 
-        self.assertNotIn(self.user_id, bot.flows)
-        self.assertTrue(any("已过期" in text for text in message.replies))
+    async def test_consent_continues_only_the_pending_qr_flow(self) -> None:
+        bot.flows[self.user_id] = bot.Flow(state="consent")
+        mock_qr_start = AsyncMock()
+        qr_start = patch.object(bot, "qr_start", new=mock_qr_start)
+        qr_start.start()
+        self.addCleanup(qr_start.stop)
 
-    async def test_login_code_lookup_rejects_expired_flow(self) -> None:
+        await bot.consent_login(self.update(), SimpleNamespace(bot=object()))
+
+        self.assertEqual(bot.flows[self.user_id].state, "qr_authorized")
+        mock_qr_start.assert_awaited_once()
+
+    async def test_consent_without_a_pending_flow_points_to_qr(self) -> None:
         message = FakeMessage()
-        bot.flows[self.user_id] = self.expired_code_flow()
+        await bot.consent_login(self.update(message), SimpleNamespace(bot=object()))
 
-        await bot.retrieve_login_code(self.user_id, 1, message, None)
+        self.assertTrue(any("/qr" in text for text in message.replies))
+        self.assertTrue(all("/add" not in text for text in message.replies))
 
-        self.assertNotIn(self.user_id, bot.flows)
-        self.assertTrue(any("已过期" in text for text in message.replies))
+    async def test_registered_routes_have_no_phone_login_or_code_commands(self) -> None:
+        app = HandlerRecorder()
+        bot.register_handlers(app)  # type: ignore[arg-type]
 
-    async def test_country_picker_rejects_expired_button(self) -> None:
-        query = FakeCallbackQuery("ctry:select:US")
+        commands: set[str] = set()
+        callback_patterns: list[str] = []
+        for handler in app.handlers:
+            if isinstance(handler, bot.CommandHandler):
+                commands.update(handler.commands)
+            elif isinstance(handler, bot.CallbackQueryHandler):
+                pattern = handler.pattern
+                callback_patterns.append(getattr(pattern, "pattern", str(pattern)))
+
+        self.assertIn("qr", commands)
+        self.assertIn("consent", commands)
+        self.assertTrue({"add", "code", "resend"}.isdisjoint(commands))
+        self.assertFalse(any("ctry:" in pattern for pattern in callback_patterns))
+
+    async def test_qr_password_flow_expiry_clears_old_state(self) -> None:
+        message = FakeMessage("a message")
         bot.flows[self.user_id] = bot.Flow(
-            state="country",
-            country_matches=["US"],
+            state="qr_password",
             started_at=time.monotonic() - bot.FLOW_TTL_SECONDS - 1,
         )
 
-        await bot.country_picker_callback(self.update(query=query), SimpleNamespace(bot=object()))
+        await bot.handle_text(self.update(message), SimpleNamespace(bot=object()))
 
         self.assertNotIn(self.user_id, bot.flows)
-        self.assertTrue(query.answers)
-        self.assertIn("已过期", str(query.answers[0][0][0]))
+        self.assertTrue(any("/qr" in text for text in message.replies))
 
-    async def test_code_picker_rejects_expired_flow(self) -> None:
-        message = FakeMessage()
-        bot.flows[self.user_id] = self.expired_code_flow()
-
-        await bot.send_account_picker(self.update(message), "code")
-
-        self.assertNotIn(self.user_id, bot.flows)
-        self.assertTrue(any("已过期" in text for text in message.replies))
+    async def test_menus_expose_qr_but_no_phone_or_code_login(self) -> None:
+        for language, forbidden in (
+            ("zh", {"添加账号", "获取验证码"}),
+            ("en", {"Add account", "Get code"}),
+        ):
+            with self.subTest(language=language):
+                markup = bot.menu_for(language)
+                labels = {button.text for row in markup.keyboard for button in row}
+                self.assertIn("🔳 QR 登录" if language == "zh" else "🔳 QR login", labels)
+                self.assertTrue(forbidden.isdisjoint(labels))
 
 
 if __name__ == "__main__":

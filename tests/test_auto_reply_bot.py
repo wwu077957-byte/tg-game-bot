@@ -104,37 +104,11 @@ class AutoReplyBotTests(unittest.IsolatedAsyncioTestCase):
         bot.pending_human_challenges.clear()
         self.tmp.cleanup()
 
-    def test_account_labels_and_country_picker_follow_language(self) -> None:
+    def test_account_labels_follow_language(self) -> None:
         row = self.store.get_account(101, self.account_id)
         row.update({"label": "Work", "group_name": "Friends"})
         self.assertIn("Group: Friends", bot.format_account(row, "en"))
         self.assertIn("分组：Friends", bot.format_account(row, "zh"))
-
-        english_buttons = [button.text for row in bot.country_start_keyboard("en").inline_keyboard for button in row]
-        chinese_buttons = [button.text for row in bot.country_start_keyboard("zh").inline_keyboard for button in row]
-        self.assertIn("United States +1", english_buttons)
-        self.assertIn("美国 +1", chinese_buttons)
-        english_countries = [button.text for row in bot.country_results_keyboard(["US", "CA"], 0, "en").inline_keyboard for button in row]
-        self.assertIn("United States +1", english_countries)
-
-    def test_delivery_instructions_and_next_channel_are_bilingual(self) -> None:
-        app_type = bot.types.auth.SentCodeTypeApp(length=5)
-        next_type = bot.types.auth.CodeTypeCall()
-        english = bot.code_delivery_message(
-            "+15551234567", app_type, next_type, 60,
-            has_matching_account=True, language="en",
-        )
-        chinese = bot.code_delivery_message(
-            "+15551234567", app_type, next_type, 60,
-            has_matching_account=True, language="zh",
-        )
-        self.assertIn("official service message", english)
-        self.assertIn("Next method offered by Telegram: Voice call", english)
-        self.assertIn("select the button below", english)
-        self.assertIn("Telegram 提供的下一种通道是：语音电话", chinese)
-        self.assertIn("明确点选下方按钮", chinese)
-        self.assertIn("/resend", english)
-        self.assertIn("/resend", chinese)
 
     def test_auto_reply_scene_labels_use_language_without_changing_templates(self) -> None:
         english = [button.text for row in bot.auto_scene_keyboard(1, "en").inline_keyboard for button in row]
