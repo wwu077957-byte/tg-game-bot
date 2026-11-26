@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import ExitStack
 import os
 import tempfile
 import unittest
@@ -289,6 +290,69 @@ class AutoReplyBotTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Two-step verification for this account: Enabled", message.replies[1][0])
         self.assertIsNotNone(message.replies[0][1]["reply_markup"])
         self.assertIsNotNone(message.replies[1][1]["reply_markup"])
+
+    async def test_every_chinese_and_english_menu_button_routes_with_or_without_icon(self) -> None:
+        expected_routes = {
+            "账号列表": "accounts",
+            "My accounts": "accounts",
+            "QR 登录": "qr_start",
+            "QR login": "qr_start",
+            "账号分组": "groups",
+            "Groups": "groups",
+            "设备会话": "devices",
+            "Devices": "devices",
+            "2FA 状态": "twofa",
+            "2FA status": "twofa",
+            "搜索账号": "search_prompt",
+            "Search": "search_prompt",
+            "自动回复": "auto_reply_entry",
+            "Auto-reply": "auto_reply_entry",
+            "通知与健康": "settings",
+            "Safety alerts": "settings",
+            "操作记录": "audit",
+            "Activity": "audit",
+            "回收站": "trash",
+            "Trash": "trash",
+            "语言 / Language": "language_command",
+            "Language": "language_command",
+            "帮助": "help_command",
+            "Help": "help_command",
+        }
+        handler_names = set(expected_routes.values())
+        context = SimpleNamespace(bot=object())
+
+        for language in ("zh", "en"):
+            for custom_emoji_enabled in (False, True):
+                with self.subTest(language=language, custom_emoji_enabled=custom_emoji_enabled):
+                    with patch.object(bot, "CUSTOM_EMOJI_ENABLED", custom_emoji_enabled):
+                        markup = bot.menu_for(language)
+                    for row in markup.keyboard:
+                        for button in row:
+                            plain_text = bot.normalize_menu_text(button.text)
+                            self.assertIn(plain_text, expected_routes, f"Unmapped {language} menu button: {button.text!r}")
+                            expected_handler = expected_routes[plain_text]
+                            for message_text in dict.fromkeys((button.text, plain_text)):
+                                with self.subTest(button=button.text, message_text=message_text):
+                                    message = FakeGateMessage()
+                                    message.text = message_text
+                                    update = SimpleNamespace(
+                                        effective_user=SimpleNamespace(id=101),
+                                        effective_chat=SimpleNamespace(type="private"),
+                                        effective_message=message,
+                                    )
+                                    with patch.object(bot, "require_private", new=AsyncMock(return_value=True)), ExitStack() as stack:
+                                        handlers = {
+                                            name: stack.enter_context(patch.object(bot, name, new=AsyncMock()))
+                                            for name in handler_names
+                                        }
+                                        await bot.handle_text(update, context)
+                                    handlers[expected_handler].assert_awaited_once_with(update, context)
+                                    self.assertEqual(
+                                        sum(handler.await_count for handler in handlers.values()),
+                                        1,
+                                        f"Menu text {message_text!r} did not route exactly once",
+                                    )
+                                    self.assertFalse(message.replies, f"Menu text {message_text!r} fell through to a reply")
 
     async def test_rename_flow_success_uses_saved_language(self) -> None:
         self.store.set_language(101, "en")

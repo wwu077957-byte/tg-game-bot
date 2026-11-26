@@ -182,6 +182,13 @@ def make_keyboard_button(text: str) -> KeyboardButton:
     return KeyboardButton(text)
 
 
+def normalize_menu_text(text: str) -> str:
+    """Match both Unicode-icon and custom-emoji reply-keyboard button text."""
+    text = canonicalize_ui_icon((text or "").strip())
+    icon = _leading_icon(text)
+    return icon[2].strip() if icon else text
+
+
 def fallback_reply_markup(markup: Any) -> Any:
     if isinstance(markup, InlineKeyboardMarkup):
         rows = []
@@ -1030,52 +1037,37 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     text = (update.effective_message.text or "").strip()
     menu_handlers = {
-        "👤 账号列表": accounts,
+        "账号列表": accounts,
         "My accounts": accounts,
-        "📱 账号列表": accounts,
-        "📱 My accounts": accounts,
-        "🔒 QR 登录": qr_start,
+        "QR 登录": qr_start,
         "QR login": qr_start,
-        "🔳 QR 登录": qr_start,
-        "🔳 QR login": qr_start,
-        "🗂 账号分组": groups,
+        "账号分组": groups,
         "Groups": groups,
-        "📁 账号分组": groups,
-        "📁 Groups": groups,
-        "🖥 设备会话": devices,
+        "设备会话": devices,
         "Devices": devices,
-        "💻 设备会话": devices,
-        "💻 Devices": devices,
         "2FA 状态": twofa,
         "2FA status": twofa,
         "🛡 2FA 状态": twofa,
         "🛡 2FA status": twofa,
         "搜索账号": search_prompt,
         "Search": search_prompt,
-        "🔎 搜索账号": search_prompt,
-        "🔎 Search": search_prompt,
-        ui_text(update.effective_user and store.get_language(update.effective_user.id) or "zh", '💬 自动回复', '💬 Auto-reply'): auto_reply_entry,
+        "自动回复": auto_reply_entry,
         "Auto-reply": auto_reply_entry,
-        "🤖 Auto-reply": auto_reply_entry,
+        "通知与健康": settings,
         "Safety alerts": settings,
-        ui_text(update.effective_user and store.get_language(update.effective_user.id) or "zh", '🔔 通知与健康', '🔔 Safety alerts & health'): settings,
         "Safety alerts & health": settings,
-        "🔔 Safety alerts": settings,
-        ui_text(update.effective_user and store.get_language(update.effective_user.id) or "zh", '🗂 操作记录', '🗂 Activity'): audit,
+        "操作记录": audit,
         "Activity": audit,
-        "🧾 Activity": audit,
-        ui_text(update.effective_user and store.get_language(update.effective_user.id) or "zh", '❌ 回收站', '❌ Trash'): trash,
         "回收站": trash,
         "Trash": trash,
-        "🗑 Trash": trash,
-        "❓ 帮助": help_command,
+        "帮助": help_command,
         "Help": help_command,
-        "❔ Help": help_command,
+        "语言 / Language": language_command,
         "Language": language_command,
-        ui_text(update.effective_user and store.get_language(update.effective_user.id) or "zh", '🌐 语言 / Language', '🌐 Language'): language_command,
     }
-    if text in menu_handlers:
-        await menu_handlers[text](update, context)
+    menu_handler = menu_handlers.get(normalize_menu_text(text))
+    if menu_handler:
+        await menu_handler(update, context)
         return
     user_id = owner_id(update)
     auto_flow = auto_flows.get(user_id)
