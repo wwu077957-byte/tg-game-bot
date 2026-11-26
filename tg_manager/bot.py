@@ -659,14 +659,16 @@ def build_account_list(
 async def read_account_identity(owner_id: int, account_id: int) -> dict[str, Any] | None:
     session = store.get_session(owner_id, account_id)
     if not session:
+        log.info("No stored Telegram session is available for profile lookup of account %s", account_id)
         return None
     client = TelegramClient(StringSession(session), API_ID, API_HASH)
+    stage = "connect"
     try:
         await asyncio.wait_for(client.connect(), timeout=8)
-        if not await asyncio.wait_for(client.is_user_authorized(), timeout=8):
-            return None
+        stage = "get_me"
         me = await asyncio.wait_for(client.get_me(), timeout=8)
         if not me:
+            log.info("Telegram profile lookup found no authorized user for account %s", account_id)
             return None
         name = " ".join(part for part in (getattr(me, "first_name", None), getattr(me, "last_name", None)) if part)
         return {
@@ -675,7 +677,12 @@ async def read_account_identity(owner_id: int, account_id: int) -> dict[str, Any
             "display_name": " ".join(name.split()),
         }
     except Exception as exc:
-        log.debug("Telegram profile lookup failed for account %s (%s)", account_id, type(exc).__name__)
+        log.info(
+            "Telegram profile lookup failed for account %s at %s (%s)",
+            account_id,
+            stage,
+            type(exc).__name__,
+        )
         return None
     finally:
         try:

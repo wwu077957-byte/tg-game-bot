@@ -170,6 +170,54 @@ class AutoReplyBotTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(button.callback_data, f"acctinfo:{self.account_id}")
         self.assertIn("Username & ID", button.text)
 
+    async def test_read_account_identity_uses_get_me_directly(self) -> None:
+        calls = {"get_me": 0, "disconnect": 0, "session": None}
+
+        class ProfileClient:
+            def __init__(self, session: object, *_args: object, **_kwargs: object) -> None:
+                calls["session"] = session
+
+            async def connect(self) -> None:
+                return None
+
+            async def get_me(self):
+                calls["get_me"] += 1
+                return SimpleNamespace(id=8351483076, first_name="Nora", last_name="Cat", username="v8erx")
+
+            async def disconnect(self) -> None:
+                calls["disconnect"] += 1
+
+        with patch.object(bot, "TelegramClient", ProfileClient), patch.object(bot, "StringSession", lambda value: value):
+            identity = await bot.read_account_identity(101, self.account_id)
+
+        self.assertEqual(calls["session"], "session")
+        self.assertEqual(calls["get_me"], 1)
+        self.assertEqual(calls["disconnect"], 1)
+        self.assertEqual(identity, {"id": 8351483076, "username": "v8erx", "display_name": "Nora Cat"})
+
+    async def test_read_account_identity_handles_unauthorized_without_changing_session(self) -> None:
+        calls = {"disconnect": 0}
+
+        class UnauthorizedProfileClient:
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                return None
+
+            async def connect(self) -> None:
+                return None
+
+            async def get_me(self):
+                return None
+
+            async def disconnect(self) -> None:
+                calls["disconnect"] += 1
+
+        with patch.object(bot, "TelegramClient", UnauthorizedProfileClient), patch.object(bot, "StringSession", lambda value: value):
+            identity = await bot.read_account_identity(101, self.account_id)
+
+        self.assertIsNone(identity)
+        self.assertEqual(calls["disconnect"], 1)
+        self.assertEqual(self.store.get_session(101, self.account_id), "session")
+
     async def test_account_info_callback_shows_username_id_and_profile_link(self) -> None:
         self.store.mark_human_verified(101)
         message = FakeGateMessage()
