@@ -31,7 +31,7 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
-from telethon import TelegramClient, events, functions
+from telethon import TelegramClient, events, functions, types
 from telethon.errors import (
     FloodWaitError,
     PasswordHashInvalidError,
@@ -102,6 +102,7 @@ auto_reply_locks: dict[tuple[int, int], asyncio.Lock] = {}
 auto_sending_peers: set[tuple[int, int]] = set()
 private_message_notifications: set[tuple[int, int, int]] = set()
 recent_device_alerts: dict[tuple[int, int], float] = {}
+NEW_DEVICE_FALLBACK_POLL_SECONDS = 60
 AUTO_NOTIFICATION_KEYS = ("notify_private_messages", "notify_auto_reply_sent", "notify_new_device")
 
 
@@ -1807,18 +1808,26 @@ async def send_owner_notification(application: Application | None, user_id: int,
         return False
 
 
-def authorization_device_label(authorization: Any) -> str:
-    device_model = str(getattr(authorization, "device_model", "") or "").strip()
-    if device_model and any(browser in device_model.casefold() for browser in ("chrome", "firefox", "safari", "edge")):
-        return device_model[:100]
-    app_name = str(getattr(authorization, "app_name", "") or "").strip()
-    app_version = str(getattr(authorization, "app_version", "") or "").strip()
-    if app_name:
-        return " ".join(part for part in (app_name, app_version) if part)[:100]
-    if device_model:
-        return device_model[:100]
-    platform = str(getattr(authorization, "platform", "") or "").strip()
-    return platform[:100] or "未知设备"
+def authorization_device_label(authorization: Any, language: str = "zh") -> str:
+    device = str(getattr(authorization, "device_model", "") or "").strip()[:80]
+    app_name = str(getattr(authorization, "app_name", "") or "").strip()[:80]
+    app_version = str(getattr(authorization, "app_version", "") or "").strip()[:40]
+    platform = str(getattr(authorization, "platform", "") or "").strip()[:60]
+    system_version = str(getattr(authorization, "system_version", "") or "").strip()[:60]
+    region = str(getattr(authorization, "region", "") or "").strip()[:80]
+    country = str(getattr(authorization, "country", "") or "").strip()[:80]
+    app = " ".join(part for part in (app_name, app_version) if part)
+    platform_label = " ".join(part for part in (platform, system_version) if part)
+    location = ", ".join(part for part in (region, country) if part)
+    if language == "en":
+        return (
+            f"Device: {device or 'Unknown device'}; App: {app or 'not provided'}; "
+            f"Platform: {platform_label or 'not provided'}; Region: {location or 'not provided by Telegram'}"
+        )
+    return (
+        f"设备：{device or '未知设备'}；应用：{app or '未提供'}；"
+        f"平台：{platform_label or '未提供'}；地区：{location or 'Telegram 未提供'}"
+    )
 
 
 async def check_new_device_authorizations(
@@ -1839,23 +1848,39 @@ async def check_new_device_authorizations(
         )
         if not new_ids:
             return False
-        new_devices = [
-            authorization_device_label(item)
-            for item in authorizations
-            if int(getattr(item, "hash", 0) or 0) in new_ids
-        ]
-        device_names = "、".join(new_devices[:5]) or "未知设备"
-        label = notification_account_label(user_id, account_id)
+        new_authorizations = []
+        for item in authorizations:
+            try:
+                authorization_id = int(getattr(item, "hash", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if authorization_id in new_ids:
+                new_authorizations.append(item)
         language = store.get_language(user_id)
+        device_names = "\n".join(
+            authorization_device_label(item, language) for item in new_authorizations[:5]
+        ) or ("未知设备" if language != "en" else "Unknown device")
+        label = f"#{account_id} ({notification_account_label(user_id, account_id)})"
         text = ui_text(
             language,
             '🔔 账号 {0} 有新设备登录：{1}。如非本人操作，请在 Telegram 官方设置中检查登录设备。',
             '🔔 Account {0} has a new login: {1}. If this was not you, review active sessions in Telegram settings.',
         ).format(label, device_names)
         sent = await send_owner_notification(application, user_id, text)
-        if sent:
-            recent_device_alerts[(user_id, account_id)] = time.monotonic()
-            store.audit(user_id, "new_device_alert_sent", account_id, "new authorization detected")
+        if not sent:
+            # Restore the previous set without the newly seen IDs so a later event/poll can retry.
+            previous_ids = []
+            for item in authorizations:
+                try:
+                    authorization_id = int(getattr(item, "hash", 0) or 0)
+                except (TypeError, ValueError):
+                    continue
+                if authorization_id not in new_ids:
+                    previous_ids.append(authorization_id)
+            store.update_authorization_snapshot(user_id, account_id, previous_ids)
+            return False
+        recent_device_alerts[(user_id, account_id)] = time.monotonic()
+        store.audit(user_id, "new_device_alert_sent", account_id, "new authorization detected")
         return sent
     except FloodWaitError as exc:
         log.info("Authorization check deferred by Telegram FloodWait (%s seconds)", getattr(exc, "seconds", "unknown"))
@@ -1864,12 +1889,19 @@ async def check_new_device_authorizations(
     return False
 
 
+async def handle_new_authorization_update(
+    client: TelegramClient, user_id: int, account_id: int, application: Application, _update: Any
+) -> None:
+    """Immediately re-check active authorizations when Telegram reports a new login."""
+    await check_new_device_authorizations(client, user_id, account_id, application)
+
+
 async def monitor_new_device_authorizations(
     client: TelegramClient, user_id: int, account_id: int, application: Application
 ) -> None:
     try:
         while True:
-            await asyncio.sleep(300)
+            await asyncio.sleep(NEW_DEVICE_FALLBACK_POLL_SECONDS)
             if not client.is_connected():
                 return
             await check_new_device_authorizations(client, user_id, account_id, application)
@@ -2088,6 +2120,10 @@ async def watch_account(user_id: int, account_id: int, session: str, application
 
         config = store.get_auto_reply_settings(user_id, account_id)
         if config and config.get("notify_new_device"):
+            async def on_authorization_update(update: Any) -> None:
+                await handle_new_authorization_update(client, user_id, account_id, application, update)
+
+            client.add_event_handler(on_authorization_update, events.Raw(types.UpdateNewAuthorization))
             # First observation establishes a quiet baseline; only later sessions alert.
             await check_new_device_authorizations(client, user_id, account_id, application)
             device_monitor_task = asyncio.create_task(

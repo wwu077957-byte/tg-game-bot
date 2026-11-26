@@ -708,7 +708,7 @@ class Store:
                 authorization_id = int(value)
             except (TypeError, ValueError):
                 continue
-            if authorization_id <= 0:
+            if authorization_id == 0:
                 continue
             digest = hmac.new(
                 self._scope_key,

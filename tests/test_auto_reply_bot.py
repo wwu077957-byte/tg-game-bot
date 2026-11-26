@@ -514,15 +514,84 @@ class AutoReplyBotTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await bot.check_new_device_authorizations(client, 101, self.account_id, application))
         self.assertEqual(owner_bot.sent, [])
         client.authorizations.append(
-            SimpleNamespace(hash=222, device_model="Firefox 150", app_name="Telegram Web", app_version="1.0", platform="Web", ip="198.51.100.7", country="Example")
+            SimpleNamespace(hash=-222, device_model="Firefox 150", app_name="Telegram Web", app_version="1.0", platform="Web", system_version="2.0", ip="198.51.100.7", region="State", country="Example")
         )
         self.assertTrue(await bot.check_new_device_authorizations(client, 101, self.account_id, application))
         self.assertEqual(len(owner_bot.sent), 1)
         text = str(owner_bot.sent[0]["text"])
         self.assertIn("new login", text)
+        self.assertIn("Account #1", text)
         self.assertIn("Firefox 150", text)
+        self.assertIn("App: Telegram Web 1.0", text)
+        self.assertIn("Platform: Web 2.0", text)
+        self.assertIn("Region: State, Example", text)
         self.assertNotIn("198.51.100.7", text)
-        self.assertNotIn("Example", text)
+        chinese = bot.authorization_device_label(client.authorizations[-1], "zh")
+        self.assertIn("应用：Telegram Web 1.0", chinese)
+        self.assertIn("平台：Web 2.0", chinese)
+        self.assertIn("地区：State, Example", chinese)
+
+    async def test_failed_new_device_notification_is_retried(self) -> None:
+        config = self.store.get_auto_reply_settings(101, self.account_id)
+        config["notify_new_device"] = True
+        self.store.save_auto_reply_config(101, self.account_id, config)
+        client = FakeAuthorizationClient([SimpleNamespace(hash=11, device_model="Phone")])
+        application = SimpleNamespace(bot=FakeNotificationBot())
+        await bot.check_new_device_authorizations(client, 101, self.account_id, application)
+        client.authorizations.append(SimpleNamespace(hash=-22, device_model="Tablet"))
+        send_ui = AsyncMock(side_effect=[RuntimeError("temporary send failure"), None])
+
+        with patch.object(bot, "send_ui_message", new=send_ui):
+            self.assertFalse(await bot.check_new_device_authorizations(client, 101, self.account_id, application))
+            self.assertTrue(await bot.check_new_device_authorizations(client, 101, self.account_id, application))
+
+        self.assertEqual(send_ui.await_count, 2)
+
+    async def test_watcher_registers_real_time_new_authorization_event(self) -> None:
+        config = self.store.get_auto_reply_settings(101, self.account_id)
+        config["notify_new_device"] = True
+        self.store.save_auto_reply_config(101, self.account_id, config)
+
+        class WatchClient:
+            def __init__(self) -> None:
+                self.handlers: list[tuple[object, object]] = []
+
+            async def connect(self) -> None:
+                return None
+
+            async def is_user_authorized(self) -> bool:
+                return True
+
+            def add_event_handler(self, callback: object, event: object) -> None:
+                self.handlers.append((callback, event))
+
+            async def run_until_disconnected(self) -> None:
+                return None
+
+            async def disconnect(self) -> None:
+                return None
+
+        client = WatchClient()
+        key = (101, self.account_id)
+        bot.monitors.pop(key, None)
+        check = AsyncMock(return_value=False)
+        with (
+            patch.object(bot, "TelegramClient", return_value=client),
+            patch.object(bot, "StringSession", side_effect=lambda value: value),
+            patch.object(bot, "check_new_device_authorizations", new=check),
+        ):
+            await bot.watch_account(101, self.account_id, "session", SimpleNamespace(bot=FakeNotificationBot()), key)
+
+        raw_handlers = [
+            (callback, event)
+            for callback, event in client.handlers
+            if isinstance(event, bot.events.Raw) and event.types is bot.types.UpdateNewAuthorization
+        ]
+        self.assertEqual(len(raw_handlers), 1)
+        with patch.object(bot, "check_new_device_authorizations", new=check):
+            await raw_handlers[0][0](SimpleNamespace(hash=-55, device="Tablet", location="Example"))
+        self.assertEqual(check.await_count, 2)
+        self.assertEqual(bot.NEW_DEVICE_FALLBACK_POLL_SECONDS, 60)
 
     async def test_custom_emoji_permission_failure_retries_with_unicode_fallback(self) -> None:
         bot.CUSTOM_EMOJI_ENABLED = True

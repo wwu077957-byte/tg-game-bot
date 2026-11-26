@@ -298,6 +298,21 @@ class StoreTests(unittest.TestCase):
         self.assertNotIn("99887766", stored)
         self.assertNotIn("11223344", stored)
 
+    def test_authorization_snapshot_accepts_signed_hashes(self) -> None:
+        account_id = self.store.add_account(101, "+15557654321", "", "session")
+        self.assertEqual(self.store.update_authorization_snapshot(101, account_id, [0, -99887766]), set())
+        self.assertEqual(
+            self.store.update_authorization_snapshot(101, account_id, [-99887766, -11223344]),
+            {-11223344},
+        )
+        with sqlite3.connect(self.db) as conn:
+            stored = conn.execute(
+                "SELECT fingerprints_json FROM telegram_authorization_snapshots WHERE account_id = ?",
+                (account_id,),
+            ).fetchone()[0]
+        self.assertNotIn("-99887766", stored)
+        self.assertNotIn("-11223344", stored)
+
     def test_missing_encryption_key_fails_closed(self) -> None:
         with self.assertRaises(RuntimeError):
             Store(str(Path(self.tmp.name) / "missing.sqlite3"), "")
